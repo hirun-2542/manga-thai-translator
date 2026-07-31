@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Environments
+.venv/
+venv/
+
+# Editors
+.idea/
+.vscode/
+*.code-workspace
+*~
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.toml
+
+# User projects and source images
+projects/
+project.json
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# Generated project content
+previews/
+exports/
+cache/
+
+# Synthetic test fixtures are safe to version
+!tests/fixtures/**

@@ -1,0 +1,16 @@
+# Manga Thai Translator Codex setup v3.1.0 (2026-07-31)
+# Primary Codex session
+model = "gpt-5.6-sol"
+model_reasoning_effort = "xhigh"
+plan_mode_reasoning_effort = "xhigh"
+
+[agents]
+enabled = true
+
+# One primary agent plus up to three independent workers.
+max_concurrent_threads_per_session = 3
+
+# Fallback settings for every spawned agent unless a custom role overrides them.
+default_subagent_model = "gpt-5.6-sol"
+default_subagent_reasoning_effort = "medium"
+interrupt_message = true
