@@ -151,6 +151,20 @@ class ImageViewer(QGraphicsView):
         for block in page.blocks:
             self._add_block(block)
 
+    def set_display_image(self, path: str | Path) -> None:
+        """Swap the displayed pixels while preserving the page and its overlays."""
+        if self._page is None or self._pixmap_item is None:
+            raise ValueError("No page is loaded")
+        image_path = Path(path)
+        if not image_path.is_file():
+            raise ValueError(f"Image file does not exist: {image_path}")
+        pixmap = QPixmap(str(image_path))
+        if pixmap.isNull():
+            raise ValueError(f"Unable to read image file: {image_path}")
+        if pixmap.size() != self._pixmap_item.pixmap().size():
+            raise ValueError("Display image dimensions must match the loaded page")
+        self._pixmap_item.setPixmap(pixmap)
+
     def set_draw_mode(self, enabled: bool) -> None:
         self._draw_mode = enabled
         self.setCursor(Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor)

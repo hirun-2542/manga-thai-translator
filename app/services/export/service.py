@@ -10,7 +10,16 @@ from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
-from PIL import Image, ImageColor, ImageDraw, ImageFont, UnidentifiedImageError
+from PIL import (
+    Image,
+    ImageChops,
+    ImageColor,
+    ImageDraw,
+    ImageFilter,
+    ImageFont,
+    ImageStat,
+    UnidentifiedImageError,
+)
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from PySide6.QtCore import QTextBoundaryFinder
 
@@ -23,7 +32,10 @@ type ExportProgressCallback = Callable[["ExportProgress"], None]
 type RgbColor = tuple[int, int, int]
 
 _MIN_FONT_SIZE = 8
-_MAX_FONT_SIZE = 48
+_MAX_FONT_SIZE = 256
+_CLEANUP_RING_MARGIN = 5
+_GRADIENT_CLEANUP_MARGIN = 4
+_MANUAL_CLEANUP_MARGIN = 16
 _STRUCTURED_FILENAMES = (
     "project-export.json",
     "project-export.csv",
@@ -99,6 +111,7 @@ class ExportService:
         font_path: str | os.PathLike[str],
         *,
         background_color: str = "white",
+        clean_background: bool = False,
         cancellation: CancellationToken | None = None,
         on_progress: ExportProgressCallback | None = None,
     ) -> ExportResult:
@@ -152,9 +165,11 @@ class ExportService:
                     page,
                     blocks,
                     cls._source_path(page, project_directory),
+                    project_directory,
                     preview_path,
                     font_file,
                     color,
+                    clean_background,
                     token,
                 )
                 warnings.extend(page_warnings)
@@ -190,6 +205,43 @@ class ExportService:
             issues=tuple(issues),
             overflow_warnings=tuple(warnings),
         )
+
+    @classmethod
+    def render_page_preview(
+        cls,
+        page: Page,
+        project_dir: str | os.PathLike[str],
+        destination: str | os.PathLike[str],
+        font_path: str | os.PathLike[str],
+        *,
+        background_color: str = "white",
+        clean_background: bool = False,
+        cancellation: CancellationToken | None = None,
+    ) -> tuple[tuple[OverflowWarning, ...], tuple[ExportIssue, ...]]:
+        """Atomically render one page, returning ``(overflow_warnings, issues)``."""
+        token = cancellation or CancellationToken()
+        token.raise_if_cancelled()
+        project_directory = Path(project_dir).resolve()
+        destination_path = Path(destination).resolve()
+        font_file = Path(font_path).resolve()
+        if destination_path.exists() and destination_path.is_dir():
+            raise IsADirectoryError(f"preview destination is a directory: {destination_path}")
+        color = cls._validate_inputs(destination_path.parent, font_file, background_color)
+        source_path = cls._source_path(page, project_directory).resolve()
+        cls._reject_source_collisions((source_path,), (destination_path,))
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        warnings, issues = cls._render_preview(
+            page,
+            cls._ordered_blocks(page.blocks),
+            source_path,
+            project_directory,
+            destination_path,
+            font_file,
+            color,
+            clean_background,
+            token,
+        )
+        return tuple(warnings), tuple(issues)
 
     @staticmethod
     def _validate_inputs(
@@ -318,9 +370,11 @@ class ExportService:
         page: Page,
         blocks: Iterable[TextBlock],
         source_path: Path,
+        project_directory: Path,
         destination: Path,
         font_file: Path,
         background_color: RgbColor,
+        clean_background: bool,
         token: CancellationToken,
     ) -> tuple[list[OverflowWarning], list[ExportIssue]]:
         try:
@@ -330,8 +384,12 @@ class ExportService:
         except (FileNotFoundError, UnidentifiedImageError, OSError) as error:
             raise ValueError(f"invalid source image {source_path}: {error}") from error
 
+        original = image.copy()
         warnings: list[OverflowWarning] = []
         issues: list[ExportIssue] = []
+        render_tasks: list[tuple[TextBlock, int, int, int, int]] = []
+        stroke_blocks: set[UUID] = set()
+        skipped_blocks: set[UUID] = set()
         for block in blocks:
             token.raise_if_cancelled()
             try:
@@ -352,13 +410,173 @@ class ExportService:
             top = max(0, int(bbox.y))
             right = min(image.width, max(left + 1, int(bbox.x + bbox.width + 0.999)))
             bottom = min(image.height, max(top + 1, int(bbox.y + bbox.height + 0.999)))
+            render_tasks.append((block, left, top, right, bottom))
+
+        for block, left, top, right, bottom in render_tasks:
+            token.raise_if_cancelled()
+            if clean_background:
+                override_path = (
+                    project_directory / "cleanups" / f"page-{page.id}" / f"block-{block.id}.png"
+                )
+                if override_path.exists():
+                    cleanup_left = max(0, left - _MANUAL_CLEANUP_MARGIN)
+                    cleanup_top = max(0, top - _MANUAL_CLEANUP_MARGIN)
+                    cleanup_right = min(image.width, right + _MANUAL_CLEANUP_MARGIN)
+                    cleanup_bottom = min(image.height, bottom + _MANUAL_CLEANUP_MARGIN)
+                    cleanup_size = (cleanup_right - cleanup_left, cleanup_bottom - cleanup_top)
+                    try:
+                        with Image.open(override_path) as override_source:
+                            if override_source.size != cleanup_size:
+                                raise ValueError(
+                                    f"expected {cleanup_size[0]}x{cleanup_size[1]}, "
+                                    f"got {override_source.width}x{override_source.height}"
+                                )
+                            override_source.load()
+                            override = override_source.convert("RGB")
+                    except (
+                        Image.DecompressionBombError,
+                        UnidentifiedImageError,
+                        OSError,
+                        ValueError,
+                    ) as error:
+                        skipped_blocks.add(block.id)
+                        issues.append(
+                            ExportIssue(
+                                message=f"invalid manual cleanup override: {error}",
+                                page_id=page.id,
+                                block_id=block.id,
+                            )
+                        )
+                        continue
+                    image.paste(override, (cleanup_left, cleanup_top))
+                    stroke_blocks.add(block.id)
+                    continue
+                outer_left = max(0, left - _CLEANUP_RING_MARGIN)
+                outer_top = max(0, top - _CLEANUP_RING_MARGIN)
+                outer_right = min(image.width, right + _CLEANUP_RING_MARGIN)
+                outer_bottom = min(image.height, bottom + _CLEANUP_RING_MARGIN)
+                sample = original.crop((outer_left, outer_top, outer_right, outer_bottom))
+                ring_mask = Image.new("L", sample.size, "white")
+                ImageDraw.Draw(ring_mask).rectangle(
+                    (
+                        left - outer_left,
+                        top - outer_top,
+                        right - outer_left - 1,
+                        bottom - outer_top - 1,
+                    ),
+                    fill="black",
+                )
+                sample_mask = ring_mask if ring_mask.getbbox() else None
+                if sample_mask is not None:
+                    ring_stats = ImageStat.Stat(sample, sample_mask)
+                    ring_luminance = ImageStat.Stat(sample.convert("L"), sample_mask).mean[0]
+                else:
+                    crop = original.crop((left, top, right, bottom))
+                    ring_stats = ImageStat.Stat(crop)
+                    ring_luminance = ImageStat.Stat(crop.convert("L")).mean[0]
+                background = tuple(ring_stats.median)
+                deviation = max(ring_stats.stddev)
+                detail = max(
+                    ImageStat.Stat(
+                        ImageChops.difference(
+                            sample,
+                            sample.filter(ImageFilter.GaussianBlur(2)),
+                        ),
+                        sample_mask,
+                    ).mean
+                )
+                # ponytail: ring/color heuristics are cheap; preserve art when uncertain.
+                flat = deviation <= 20 or (ring_luminance >= 210 and deviation <= 35)
+                smooth_gradient = not flat and detail <= 2.1
+                if not flat and not smooth_gradient:
+                    skipped_blocks.add(block.id)
+                    issues.append(
+                        ExportIssue(
+                            message=(
+                                "background cleanup skipped: complex artwork requires "
+                                "manual/context-aware cleanup"
+                            ),
+                            page_id=page.id,
+                            block_id=block.id,
+                        )
+                    )
+                    continue
+                background_luminance = (
+                    Image.new("RGB", (1, 1), background).convert("L").getpixel((0, 0))
+                )
+                clean_left, clean_top = left, top
+                crop = original.crop((left, top, right, bottom))
+                if smooth_gradient:
+                    clean_left = left - _GRADIENT_CLEANUP_MARGIN
+                    clean_top = top - _GRADIENT_CLEANUP_MARGIN
+                    clean_right = right + _GRADIENT_CLEANUP_MARGIN
+                    clean_bottom = bottom + _GRADIENT_CLEANUP_MARGIN
+                    cleaned = (
+                        cls._reconstruct_gradient(
+                            original.crop((clean_left, clean_top, clean_right, clean_bottom)),
+                            original.crop(
+                                (
+                                    clean_left - 8,
+                                    clean_top,
+                                    clean_left,
+                                    clean_bottom,
+                                )
+                            ),
+                            original.crop(
+                                (
+                                    clean_right,
+                                    clean_top,
+                                    clean_right + 8,
+                                    clean_bottom,
+                                )
+                            ),
+                        )
+                        if (
+                            clean_left >= 8
+                            and clean_top >= 0
+                            and clean_right + 8 <= original.width
+                            and clean_bottom <= original.height
+                        )
+                        else None
+                    )
+                else:
+                    cleaned = cls._inpaint_glyphs(crop, background)
+                if smooth_gradient and cleaned is None:
+                    skipped_blocks.add(block.id)
+                    issues.append(
+                        ExportIssue(
+                            message=(
+                                "background cleanup skipped: smooth-gradient context "
+                                "was unavailable"
+                            ),
+                            page_id=page.id,
+                            block_id=block.id,
+                        )
+                    )
+                    continue
+                if cleaned is None:
+                    image.paste(background, (left, top, right, bottom))
+                    if background_luminance < 145:
+                        stroke_blocks.add(block.id)
+                else:
+                    image.paste(cleaned, (clean_left, clean_top))
+                    if background_luminance < 145:
+                        stroke_blocks.add(block.id)
+            else:
+                image.paste(background_color, (left, top, right, bottom))
+
+        for block, left, top, right, bottom in render_tasks:
+            token.raise_if_cancelled()
+            if block.id in skipped_blocks:
+                continue
             width, height = right - left, bottom - top
             rendered, overflow = cls._render_text_box(
                 block.translated_text,
                 width,
                 height,
                 font_file,
-                background_color,
+                image.crop((left, top, right, bottom)),
+                add_stroke=block.id in stroke_blocks,
             )
             image.paste(rendered, (left, top))
             if overflow:
@@ -375,9 +593,90 @@ class ExportService:
                     )
                 )
 
+        for block, left, top, right, bottom in render_tasks:
+            if block.id in skipped_blocks:
+                image.paste(original.crop((left, top, right, bottom)), (left, top))
+
         token.raise_if_cancelled()
         cls._atomic_image(destination, image)
         return warnings, issues
+
+    @staticmethod
+    def _inpaint_glyphs(
+        crop: Image.Image,
+        background: RgbColor,
+    ) -> Image.Image | None:
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            return None
+
+        pixels = np.asarray(crop)
+        distance = np.max(
+            np.abs(pixels.astype(np.int16) - np.asarray(background, dtype=np.int16)),
+            axis=2,
+        )
+        seeds = (distance >= 70).astype(np.uint8) * 255
+        mask = ExportService._compact_glyph_mask(seeds, crop, expansion=9)
+        if cv2.countNonZero(mask) < 4:
+            return None
+        return Image.fromarray(cv2.inpaint(pixels, mask, 3, cv2.INPAINT_TELEA))
+
+    @staticmethod
+    def _reconstruct_gradient(
+        crop: Image.Image,
+        left_strip: Image.Image,
+        right_strip: Image.Image,
+    ) -> Image.Image | None:
+        try:
+            import numpy as np
+        except ImportError:
+            return None
+
+        if left_strip.size != (8, crop.height) or right_strip.size != (8, crop.height):
+            return None
+        if any(
+            max(
+                ImageStat.Stat(
+                    ImageChops.difference(strip, strip.filter(ImageFilter.GaussianBlur(2)))
+                ).mean
+            )
+            > 2.1
+            for strip in (left_strip, right_strip)
+        ):
+            return None
+        left = np.median(np.asarray(left_strip), axis=1)
+        right = np.median(np.asarray(right_strip), axis=1)
+        blend = ((np.arange(crop.width) + 4.5) / (crop.width + 8))[None, :, None]
+        model = left[:, None, :] * (1 - blend) + right[:, None, :] * blend
+        return Image.fromarray(np.clip(model, 0, 255).astype(np.uint8))
+
+    @staticmethod
+    def _compact_glyph_mask(seeds, crop: Image.Image, *, expansion: int):
+        import cv2
+        import numpy as np
+
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(seeds, connectivity=8)
+        mask = np.zeros(crop.size[::-1], dtype=np.uint8)
+        for label in range(1, count):
+            x, y, width, height, area = (int(value) for value in stats[label])
+            if (
+                area < 4
+                or area > mask.size // 4
+                or width * 100 >= crop.width * 55
+                or height * 100 >= crop.height * 55
+                or x == 0
+                or y == 0
+                or x + width == crop.width
+                or y + height == crop.height
+            ):
+                continue
+            mask[labels == label] = 255
+        kernel_size = expansion * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        mask = cv2.dilate(mask, kernel, iterations=1)
+        return mask
 
     @classmethod
     def _render_text_box(
@@ -386,31 +685,60 @@ class ExportService:
         width: int,
         height: int,
         font_file: Path,
-        background_color: RgbColor,
+        background: RgbColor | Image.Image,
+        *,
+        add_stroke: bool = False,
     ) -> tuple[Image.Image, bool]:
-        canvas = Image.new("RGB", (width, height), background_color)
+        canvas = (
+            background.copy().convert("RGB")
+            if isinstance(background, Image.Image)
+            else Image.new("RGB", (width, height), background)
+        )
         draw = ImageDraw.Draw(canvas)
+        luminance = ImageStat.Stat(canvas.convert("L")).mean[0]
+        fill = "black" if luminance >= 145 else "white"
+        stroke_fill = "white" if fill == "black" else "black"
+        padding = max(1, min(width, height) // 10)
+        available_width = max(1, width - 2 * padding)
+        available_height = max(1, height - 2 * padding)
         selected: (
-            tuple[ImageFont.FreeTypeFont, list[str], int, tuple[int, int, int, int]] | None
+            tuple[ImageFont.FreeTypeFont, list[str], int, int, tuple[int, int, int, int]] | None
         ) = None
-        for size in range(min(_MAX_FONT_SIZE, max(_MIN_FONT_SIZE, height)), _MIN_FONT_SIZE - 1, -1):
+        maximum_size = min(_MAX_FONT_SIZE, max(_MIN_FONT_SIZE, available_height))
+        for size in range(maximum_size, _MIN_FONT_SIZE - 1, -1):
             font = ImageFont.truetype(font_file, size)
-            lines = cls._wrap_text(draw, text, font, width)
+            lines = cls._wrap_text(draw, text, font, available_width)
             spacing = max(1, size // 5)
-            bounds = draw.multiline_textbbox((0, 0), "\n".join(lines), font=font, spacing=spacing)
-            selected = font, lines, spacing, bounds
-            if bounds[2] - bounds[0] <= width and bounds[3] - bounds[1] <= height:
+            stroke_width = max(1, size // 18) if add_stroke else 0
+            bounds = draw.multiline_textbbox(
+                (0, 0),
+                "\n".join(lines),
+                font=font,
+                spacing=spacing,
+                stroke_width=stroke_width,
+                align="center",
+            )
+            selected = font, lines, spacing, stroke_width, bounds
+            if (
+                bounds[2] - bounds[0] <= available_width
+                and bounds[3] - bounds[1] <= available_height
+            ):
                 break
 
         assert selected is not None
-        font, lines, spacing, bounds = selected
-        overflow = bounds[2] - bounds[0] > width or bounds[3] - bounds[1] > height
+        font, lines, spacing, stroke_width, bounds = selected
+        text_width = bounds[2] - bounds[0]
+        text_height = bounds[3] - bounds[1]
+        overflow = text_width > available_width or text_height > available_height
         draw.multiline_text(
-            (-bounds[0], -bounds[1]),
+            ((width - text_width) / 2 - bounds[0], (height - text_height) / 2 - bounds[1]),
             "\n".join(lines),
-            fill="black",
+            fill=fill,
             font=font,
             spacing=spacing,
+            stroke_width=stroke_width,
+            stroke_fill=stroke_fill,
+            align="center",
         )
         return canvas, overflow
 

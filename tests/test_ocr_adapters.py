@@ -8,6 +8,7 @@ from PIL import Image
 from app.core.models import BoundingBox, SourceLanguage
 from app.services.errors import ProviderError, UnsupportedLanguageError
 from app.services.ocr import MangaOcrProvider, PaddleOcrProvider
+from app.services.ocr.paddle_ocr import _as_array
 from app.services.types import ImageInput
 
 
@@ -174,6 +175,7 @@ def test_paddle_ocr_maps_languages_uses_cpu_and_caches_per_language(
         "chinese_cht",
     ]
     assert all(call["device"] == "cpu" for call in factory_calls)
+    assert all(call["enable_mkldnn"] is False for call in factory_calls)
     assert all(
         call["use_doc_orientation_classify"] is False
         and call["use_doc_unwarping"] is False
@@ -183,6 +185,82 @@ def test_paddle_ocr_maps_languages_uses_cpu_and_caches_per_language(
     assert crop_sizes == [(3, 4)] * len(languages)
     assert all(result.source_text == "first\nsecond" for result in results)
     assert all(result.confidence == 0.5 for result in results)
+
+
+def test_paddle_detection_parses_groups_and_reuses_english_model(tmp_path: Path) -> None:
+    source = tmp_path / "detection.png"
+    image = _image(source)
+    before = source.read_bytes()
+    factory_calls = []
+    responses = [
+        [
+            type(
+                "JsonResult",
+                (),
+                {
+                    "json": {
+                        "res": {
+                            "rec_boxes": [
+                                [10, 10, 80, 30],
+                                [180, 12, 230, 32],
+                                [12, 36, 78, 56],
+                                [10, 106, 80, 306],
+                            ],
+                            "rec_scores": [1.4, 0.8, -0.2, 0.6],
+                        }
+                    }
+                },
+            )()
+        ],
+        [{"rec_texts": ["recognized"], "rec_scores": [0.9]}],
+    ]
+
+    class Model:
+        def predict(self, crop):
+            return responses.pop(0)
+
+    def factory(**kwargs):
+        factory_calls.append(kwargs)
+        return Model()
+
+    provider = PaddleOcrProvider(model_factory=factory)
+
+    regions = asyncio.run(provider.detect(image))
+    result = asyncio.run(
+        provider.recognize(
+            image,
+            BoundingBox(x=0, y=0, width=2, height=2),
+            SourceLanguage.EN,
+        )
+    )
+
+    assert len(factory_calls) == 1
+    assert [region.bbox.model_dump() for region in regions] == [
+        {"x": 10.0, "y": 10.0, "width": 70.0, "height": 46.0},
+        {"x": 180.0, "y": 12.0, "width": 50.0, "height": 20.0},
+        {"x": 10.0, "y": 106.0, "width": 70.0, "height": 200.0},
+    ]
+    assert [region.confidence for region in regions] == [0.5, 0.8, 0.6]
+    assert result.source_text == "recognized"
+    assert source.read_bytes() == before
+
+
+def test_paddle_detection_returns_empty_and_rejects_malformed(tmp_path: Path) -> None:
+    responses = [
+        [],
+        [{"res": {"rec_boxes": [[1, 2, 3, 4]], "rec_scores": []}}],
+    ]
+
+    class Model:
+        def predict(self, crop):
+            return responses.pop(0)
+
+    provider = PaddleOcrProvider(model_factory=lambda **kwargs: Model())
+    image = _image(tmp_path / "detections.png")
+
+    assert asyncio.run(provider.detect(image)) == []
+    with pytest.raises(ProviderError, match="malformed detections"):
+        asyncio.run(provider.detect(image))
 
 
 @pytest.mark.parametrize(
@@ -257,3 +335,18 @@ def test_paddle_ocr_rejects_auto_and_bad_image(tmp_path: Path) -> None:
         asyncio.run(provider.recognize(image, bbox, SourceLanguage.AUTO))
     with pytest.raises(ProviderError, match="image not found"):
         asyncio.run(provider.recognize(image, bbox, SourceLanguage.EN))
+
+
+def test_paddle_array_conversion_normalizes_rgba_to_rgb(monkeypatch) -> None:
+    seen = {}
+
+    class Numpy:
+        @staticmethod
+        def asarray(image):
+            seen["mode"] = image.mode
+            return "array"
+
+    monkeypatch.setattr("app.services.ocr.paddle_ocr.import_module", lambda _name: Numpy)
+
+    assert _as_array(Image.new("RGBA", (2, 2))) == "array"
+    assert seen["mode"] == "RGB"

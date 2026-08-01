@@ -59,6 +59,35 @@ def test_zoom_reset_and_fit(qapp, tmp_path):
     assert viewer.transform().m11() > 0
 
 
+def test_display_image_swap_preserves_page_overlays_and_selection(qapp, tmp_path):
+    page_id = uuid4()
+    block = TextBlock(
+        page_id=page_id,
+        bbox=BoundingBox(x=10, y=10, width=40, height=30),
+        reading_order=1,
+    )
+    viewer = ImageViewer()
+    viewer.set_page(make_page(tmp_path, blocks=[block]).model_copy(update={"id": page_id}))
+    viewer.select_block(block.id)
+    item = viewer._items[block.id]
+    replacement = tmp_path / "preview.png"
+    image = QImage(200, 120, QImage.Format.Format_RGB32)
+    image.fill(QColor("blue"))
+    assert image.save(str(replacement))
+
+    viewer.set_display_image(replacement)
+
+    assert viewer.selected_block_id == block.id
+    assert viewer._items[block.id] is item
+    assert viewer._page.id == page_id
+    assert viewer._pixmap_item.pixmap().toImage().pixelColor(0, 0) == QColor("blue")
+
+    wrong_size = tmp_path / "wrong.png"
+    assert QImage(10, 10, QImage.Format.Format_RGB32).save(str(wrong_size))
+    with pytest.raises(ValueError, match="dimensions"):
+        viewer.set_display_image(wrong_size)
+
+
 def test_create_select_update_and_delete(qapp, tmp_path):
     viewer = ImageViewer()
     page = make_page(tmp_path)

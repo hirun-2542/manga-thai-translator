@@ -6,12 +6,14 @@ from uuid import uuid4
 
 from PySide6.QtCore import QThread
 
-from app.core.models import Project
+from app.core.models import Page, Project
 from app.services.workflow import CancellationToken
-from app.ui.workers import ExportWorker, WorkflowWorker
+from app.ui.workers import ExportWorker, FolderTranslationWorker, PreviewWorker, WorkflowWorker
 
 
-def _start(worker: WorkflowWorker | ExportWorker) -> QThread:
+def _start(
+    worker: WorkflowWorker | FolderTranslationWorker | ExportWorker | PreviewWorker,
+) -> QThread:
     thread = QThread()
     worker.moveToThread(thread)
     thread.started.connect(worker.run)
@@ -125,6 +127,75 @@ def test_unexpected_error_emits_useful_message(qapp) -> None:
     assert finished == [True]
 
 
+def test_folder_translation_worker_forwards_snapshot_progress_off_gui_thread(
+    qapp, tmp_path
+) -> None:
+    result = object()
+    gui_thread_id = threading.get_ident()
+
+    class Service:
+        async def run(self, project, project_dir, **kwargs):
+            self.thread_id = threading.get_ident()
+            self.arguments = (project, project_dir, kwargs)
+            kwargs["on_progress"]("page complete")
+            return result
+
+    service = Service()
+    project = Project(name="folder")
+    worker = FolderTranslationWorker(service, project, tmp_path)
+    project.name = "edited"
+    progress = []
+    completed = []
+    worker.progress.connect(progress.append)
+    worker.completed.connect(completed.append)
+
+    thread = _start(worker)
+    _wait(qapp, thread)
+
+    snapshot, project_dir, kwargs = service.arguments
+    assert service.thread_id != gui_thread_id
+    assert snapshot.name == "folder"
+    assert project_dir == tmp_path
+    assert isinstance(kwargs["cancellation"], CancellationToken)
+    assert progress == ["page complete"]
+    assert completed == [result]
+
+
+def test_folder_translation_cancel_interrupts_non_polling_await(qapp, tmp_path) -> None:
+    started = threading.Event()
+
+    class Service:
+        async def run(self, project, project_dir, **kwargs):
+            self.cancellation = kwargs["cancellation"]
+            started.set()
+            await asyncio.sleep(0.05)
+            return object()
+
+    service = Service()
+    worker = FolderTranslationWorker(service, Project(name="cancel folder"), tmp_path)
+    completed = []
+    cancelled = []
+    failed = []
+    finished = []
+    worker.completed.connect(completed.append)
+    worker.cancelled.connect(lambda: cancelled.append(True))
+    worker.failed.connect(failed.append)
+    worker.finished.connect(lambda: finished.append(True))
+
+    thread = _start(worker)
+    assert started.wait(1)
+    cancel_started = time.monotonic()
+    worker.cancel()
+    _wait(qapp, thread)
+
+    assert time.monotonic() - cancel_started < 0.5
+    assert service.cancellation.is_cancelled
+    assert completed == []
+    assert cancelled == [True]
+    assert failed == []
+    assert finished == [True]
+
+
 def test_block_scope_and_mode_are_forwarded_without_deduplication(qapp) -> None:
     block_id = uuid4()
     cases = [
@@ -196,10 +267,42 @@ def test_export_forwards_snapshot_progress_and_result_off_gui_thread(qapp, tmp_p
     assert forwarded_output == output_dir
     assert forwarded_font == font_path
     assert kwargs["background_color"] == "#123456"
+    assert kwargs["clean_background"] is False
     assert isinstance(kwargs["cancellation"], CancellationToken)
     assert progress == ["preview complete"]
     assert completed == [result]
     assert finished == [True]
+
+
+def test_preview_forwards_snapshot_and_clean_background_off_gui_thread(qapp, tmp_path) -> None:
+    page = Page(source_path="page.png", width=20, height=30)
+    destination = tmp_path / "previews" / "page.png"
+    gui_thread_id = threading.get_ident()
+
+    class Service:
+        @classmethod
+        def render_page_preview(cls, page, project_dir, destination, font_path, **kwargs):
+            cls.thread_id = threading.get_ident()
+            cls.arguments = (page, project_dir, destination, font_path, kwargs)
+            return ("warning",), ("issue",)
+
+    worker = PreviewWorker(page, tmp_path, destination, tmp_path / "font.ttf", Service)
+    completed = []
+    worker.completed.connect(completed.append)
+    page.width = 99
+
+    thread = _start(worker)
+    _wait(qapp, thread)
+
+    snapshot, project_dir, forwarded_destination, forwarded_font, kwargs = Service.arguments
+    assert Service.thread_id != gui_thread_id
+    assert snapshot.width == 20
+    assert project_dir == tmp_path
+    assert forwarded_destination == destination
+    assert forwarded_font == tmp_path / "font.ttf"
+    assert kwargs["clean_background"] is True
+    assert isinstance(kwargs["cancellation"], CancellationToken)
+    assert completed == [(snapshot.id, destination, ("warning",), ("issue",))]
 
 
 def test_export_cancel_is_direct_and_cooperative(qapp, tmp_path: Path) -> None:

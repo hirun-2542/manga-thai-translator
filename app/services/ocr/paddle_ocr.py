@@ -14,6 +14,7 @@ from app.core.models import BoundingBox, SourceLanguage
 from app.services.errors import ProviderError, UnsupportedLanguageError
 from app.services.ocr._image import load_crop
 from app.services.ocr.base import OcrCapabilities, OcrResult
+from app.services.text_detection import DetectedRegion
 from app.services.types import ImageInput
 
 type PaddleOcrFactory = Callable[..., Any]
@@ -77,6 +78,22 @@ class PaddleOcrProvider:
             detected_language=language,
         )
 
+    async def detect(self, image: ImageInput) -> list[DetectedRegion]:
+        try:
+            raw = await asyncio.to_thread(self._detect_sync, image)
+            return _parse_detections(raw)
+        except ProviderError:
+            raise
+        except Exception as error:
+            raise ProviderError(
+                f"{self.name} detection failed: {error}", recoverable=True
+            ) from error
+
+    def _detect_sync(self, image: ImageInput) -> object:
+        source = load_crop(image, BoundingBox(x=0, y=0, width=image.width, height=image.height))
+        model_input = source if self._model_factory is not None else _as_array(source)
+        return self._model_instance(SourceLanguage.EN).predict(model_input)
+
     def _recognize_sync(
         self,
         image: ImageInput,
@@ -95,6 +112,7 @@ class PaddleOcrProvider:
                     self._models[source_language] = factory(
                         lang=_LANGUAGES[source_language],
                         device=self._device,
+                        enable_mkldnn=False,
                         use_doc_orientation_classify=False,
                         use_doc_unwarping=False,
                         use_textline_orientation=False,
@@ -120,7 +138,7 @@ class PaddleOcrProvider:
 
 def _as_array(image: Image.Image) -> object:
     try:
-        return import_module("numpy").asarray(image)
+        return import_module("numpy").asarray(image.convert("RGB"))
     except (ImportError, ModuleNotFoundError) as error:
         raise ProviderError(
             "PaddleOCR image conversion is unavailable; install the 'ocr' optional extra",
@@ -159,6 +177,73 @@ def _parse_result(raw: object) -> tuple[str, float]:
     return "\n".join(texts), sum(scores) / len(scores)
 
 
+def _parse_detections(raw: object) -> list[DetectedRegion]:
+    entries = [raw] if _detection_fields(raw) is not None else _as_entries(raw)
+    regions = []
+    for entry in entries:
+        fields = _detection_fields(entry)
+        if fields is None:
+            raise ProviderError("PaddleOCR returned malformed detections", recoverable=True)
+        raw_boxes, raw_scores = map(_as_values, fields)
+        if raw_boxes is None or raw_scores is None or len(raw_boxes) != len(raw_scores):
+            raise ProviderError("PaddleOCR returned malformed detections", recoverable=True)
+        for raw_box, raw_score in zip(raw_boxes, raw_scores, strict=True):
+            values = _as_values(raw_box)
+            if values is None or len(values) != 4:
+                raise ProviderError("PaddleOCR returned an invalid detection box", recoverable=True)
+            try:
+                x1, y1, x2, y2 = (float(value) for value in values)
+                score = float(raw_score)
+            except (TypeError, ValueError):
+                raise ProviderError(
+                    "PaddleOCR returned malformed detections", recoverable=True
+                ) from None
+            if not all(isfinite(value) for value in (x1, y1, x2, y2, score)):
+                raise ProviderError("PaddleOCR returned malformed detections", recoverable=True)
+            if x2 <= x1 or y2 <= y1:
+                raise ProviderError("PaddleOCR returned an invalid detection box", recoverable=True)
+            regions.append(
+                DetectedRegion(
+                    bbox=BoundingBox(x=x1, y=y1, width=x2 - x1, height=y2 - y1),
+                    confidence=min(1.0, max(0.0, score)),
+                )
+            )
+    return _group_lines(regions)
+
+
+def _group_lines(regions: list[DetectedRegion]) -> list[DetectedRegion]:
+    groups: list[list[DetectedRegion]] = []
+    # ponytail: gap/center grouping cannot see bubble borders; replace with segmentation when needed.
+    for region in sorted(regions, key=lambda item: (item.bbox.y, item.bbox.x)):
+        candidates = []
+        center = region.bbox.x + region.bbox.width / 2
+        for index, group in enumerate(groups):
+            previous = group[-1].bbox
+            gap = region.bbox.y - (previous.y + previous.height)
+            center_distance = abs(center - (previous.x + previous.width / 2))
+            line_height = min(region.bbox.height, previous.height)
+            if gap <= line_height * 0.75 and center_distance <= line_height * 1.5:
+                candidates.append((abs(gap), center_distance, index))
+        if candidates:
+            groups[min(candidates)[2]].append(region)
+        else:
+            groups.append([region])
+
+    merged = []
+    for group in groups:
+        left = min(region.bbox.x for region in group)
+        top = min(region.bbox.y for region in group)
+        right = max(region.bbox.x + region.bbox.width for region in group)
+        bottom = max(region.bbox.y + region.bbox.height for region in group)
+        merged.append(
+            DetectedRegion(
+                bbox=BoundingBox(x=left, y=top, width=right - left, height=bottom - top),
+                confidence=sum(region.confidence for region in group) / len(group),
+            )
+        )
+    return merged
+
+
 def _as_values(value: object) -> list[object] | None:
     if isinstance(value, (str, bytes, Mapping)):
         return None
@@ -192,4 +277,22 @@ def _result_fields(result: object) -> tuple[object, object] | None:
         value = value["res"]
     if isinstance(value, Mapping) and ("rec_texts" in value or "rec_scores" in value):
         return value.get("rec_texts"), value.get("rec_scores")
+    return None
+
+
+def _detection_fields(result: object) -> tuple[object, object] | None:
+    if hasattr(result, "rec_boxes") or hasattr(result, "rec_scores"):
+        return getattr(result, "rec_boxes", None), getattr(result, "rec_scores", None)
+    value: object = result
+    if not isinstance(value, Mapping) and hasattr(value, "json"):
+        value = value.json() if callable(value.json) else value.json
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    if isinstance(value, Mapping) and isinstance(value.get("res"), Mapping):
+        value = value["res"]
+    if isinstance(value, Mapping) and ("rec_boxes" in value or "rec_scores" in value):
+        return value.get("rec_boxes"), value.get("rec_scores")
     return None
