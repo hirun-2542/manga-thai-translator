@@ -327,9 +327,99 @@ def test_translation_provider_failure_is_reported_without_crashing(tmp_path: Pat
     block = result.project.pages[0].blocks[0]
     assert block.translated_text == "keep"
     assert block.status is BlockStatus.OCR_COMPLETE
-    assert [(issue.stage, issue.message) for issue in result.issues] == [
-        ("translation", "provider unavailable")
+    assert [(issue.stage, issue.message, issue.page_id) for issue in result.issues] == [
+        ("translation", "provider unavailable", page.id)
     ]
+
+
+def test_translate_all_pages_batches_by_page_and_continues_after_failure(tmp_path: Path) -> None:
+    first = _page("first.png", language=SourceLanguage.EN)
+    second = _page("second.png", language=SourceLanguage.JA)
+    third = _page("third.png", language=SourceLanguage.KO)
+    first.blocks = [_block(first, 3, translated_text="keep-1"), _block(first, 1)]
+    second.blocks = [_block(second, 7, translated_text="keep-2")]
+    third.blocks = [_block(third, 2)]
+    for page in (first, second, third):
+        for block in page.blocks:
+            block.source_text = f"source-{block.reading_order}"
+            block.status = BlockStatus.OCR_REVIEWED
+    calls = []
+    updates = []
+
+    class PerPageTranslation:
+        async def translate_blocks(self, blocks, context):
+            calls.append([(block.id, block.reading_order) for block in blocks])
+            if blocks[0].id == second.blocks[0].id:
+                raise TimeoutError("page timed out")
+            return [
+                TranslationResult(id=block.id, translated_text=f"new-{block.reading_order}")
+                for block in reversed(blocks)
+            ]
+
+    result = _run(
+        Project(name="per page", pages=[first, second, third]),
+        tmp_path,
+        translation=PerPageTranslation(),
+        mode="translate",
+        on_progress=updates.append,
+    )
+
+    assert calls == [
+        [(first.blocks[0].id, 3), (first.blocks[1].id, 1)],
+        [(second.blocks[0].id, 7)],
+        [(third.blocks[0].id, 2)],
+    ]
+    assert [block.translated_text for block in result.project.pages[0].blocks] == ["new-3", "new-1"]
+    assert result.project.pages[1].blocks[0].translated_text == "keep-2"
+    assert result.project.pages[1].blocks[0].status is BlockStatus.OCR_REVIEWED
+    assert result.project.pages[2].blocks[0].translated_text == "new-2"
+    assert [(issue.page_id, issue.message, issue.recoverable) for issue in result.issues] == [
+        (second.id, "page timed out", True)
+    ]
+    assert [
+        (update.current, update.total, update.page_id, update.block_id) for update in updates
+    ] == [
+        (1, 4, first.id, first.blocks[0].id),
+        (2, 4, first.id, first.blocks[1].id),
+        (3, 4, second.id, second.blocks[0].id),
+        (4, 4, third.id, third.blocks[0].id),
+    ]
+
+
+def test_translate_all_pages_cancellation_stops_before_next_page_request(tmp_path: Path) -> None:
+    first = _page("first.png", language=SourceLanguage.EN)
+    second = _page("second.png", language=SourceLanguage.EN)
+    first.blocks = [_block(first, 1)]
+    second.blocks = [_block(second, 1)]
+    for page in (first, second):
+        page.blocks[0].source_text = "reviewed"
+        page.blocks[0].status = BlockStatus.OCR_REVIEWED
+    token = CancellationToken()
+    calls = []
+    project = Project(name="cancel pages", pages=[first, second])
+    before = project.model_dump()
+
+    class CapturingTranslation:
+        async def translate_blocks(self, blocks, context):
+            calls.append([block.id for block in blocks])
+            return [TranslationResult(id=blocks[0].id, translated_text="new")]
+
+    def cancel_after_first_page(update: ProgressUpdate) -> None:
+        if update.page_id == first.id:
+            token.cancel()
+
+    with pytest.raises(WorkflowCancelled, match="cancelled"):
+        _run(
+            project,
+            tmp_path,
+            translation=CapturingTranslation(),
+            mode="translate",
+            cancellation=token,
+            on_progress=cancel_after_first_page,
+        )
+
+    assert calls == [[first.blocks[0].id]]
+    assert project.model_dump() == before
 
 
 def test_cancellation_after_provider_await_leaves_original_unchanged(tmp_path: Path) -> None:

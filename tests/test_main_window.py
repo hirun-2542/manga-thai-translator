@@ -2,6 +2,7 @@ import asyncio
 import threading
 import time
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from PIL import ImageFont
@@ -23,8 +24,9 @@ from app.core.models import (
 )
 from app.main import main
 from app.persistence.project_repository import ProjectRepository
+from app.services.export import ExportIssue, ExportResult, OverflowWarning
 from app.services.text_detection import MockTextDetectionProvider
-from app.services.workflow import WorkflowResult
+from app.services.workflow import WorkflowIssue, WorkflowResult
 from app.ui.main_window import MainWindow
 
 
@@ -1516,6 +1518,80 @@ def test_workflow_issues_are_visible_and_current_page_is_preserved(
     assert "Detection issue: image not found" in window.workflow_log.toPlainText()
     assert "completed with 1 issue" in window.progress_label.text()
     assert not window.progress_dock.isHidden()
+
+
+def test_workflow_issue_format_includes_visible_numbers_and_unknown_ids(
+    qapp, tmp_path: Path
+) -> None:
+    project = make_project(tmp_path)
+    block = TextBlock(
+        page_id=project.pages[1].id,
+        bbox=BoundingBox(x=5, y=5, width=20, height=20),
+        reading_order=7,
+    )
+    project.pages[1].blocks = [block]
+    window = MainWindow()
+    window.set_project(project)
+
+    known = WorkflowIssue(
+        stage="translation",
+        message="review required",
+        page_id=project.pages[1].id,
+        block_id=block.id,
+        recoverable=True,
+    )
+    unknown_page_id = uuid4()
+    unknown_block_id = uuid4()
+    unknown = known.model_copy(update={"page_id": unknown_page_id, "block_id": unknown_block_id})
+
+    assert window._format_issue(known) == (
+        "Translation issue: review required "
+        f"(Page 2, Block 7, page_id={project.pages[1].id}, block_id={block.id})"
+    )
+    assert window._format_issue(unknown) == (
+        "Translation issue: review required "
+        f"(page_id={unknown_page_id}, block_id={unknown_block_id})"
+    )
+
+
+def test_export_and_preview_logs_include_visible_numbers_and_uuids(qapp, tmp_path: Path) -> None:
+    project = make_project(tmp_path)
+    page = project.pages[1]
+    block = TextBlock(
+        page_id=page.id,
+        bbox=BoundingBox(x=5, y=5, width=20, height=20),
+        reading_order=7,
+    )
+    page.blocks = [block]
+    window = MainWindow()
+    window.set_project(project)
+    issue = ExportIssue(message="cleanup required", page_id=page.id, block_id=block.id)
+    warning = OverflowWarning(message="text overflow", page_id=page.id, block_id=block.id)
+    issue_message = (
+        f"Export issue: cleanup required (Page 2, Block 7, page_id={page.id}, block_id={block.id})"
+    )
+    warning_message = (
+        f"Overflow warning: text overflow (Page 2, Block 7, page_id={page.id}, block_id={block.id})"
+    )
+
+    window._export_completed(
+        ExportResult(
+            json_path=tmp_path / "export.json",
+            csv_path=tmp_path / "export.csv",
+            txt_path=tmp_path / "export.txt",
+            issues=(issue,),
+            overflow_warnings=(warning,),
+        )
+    )
+    export_log = window.workflow_log.toPlainText()
+    assert issue_message in export_log
+    assert warning_message in export_log
+
+    window.workflow_log.clear()
+    window._preview_completed((page.id, tmp_path / "preview.png", (warning,), (issue,)))
+    preview_log = window.workflow_log.toPlainText()
+    assert issue_message in preview_log
+    assert warning_message in preview_log
 
 
 def test_cancel_and_close_wait_for_worker_without_mutating_project(

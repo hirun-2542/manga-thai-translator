@@ -382,15 +382,6 @@ class WorkflowService:
         if not items:
             return
 
-        inputs = [
-            TranslationInput(
-                id=block.id,
-                source_language=language,
-                source_text=block.source_text,
-                reading_order=block.reading_order,
-            )
-            for block, language in items
-        ]
         context = TranslationContext(
             default_source_language=project.settings.default_source_language,
             target_language=project.settings.target_language,
@@ -399,53 +390,87 @@ class WorkflowService:
             previous_summary=project.previous_summary,
             translation_note=project.translation_note,
         )
-        token.raise_if_cancelled()
-        try:
-            raw_results = await self._translation_provider.translate_blocks(inputs, context)
-            token.raise_if_cancelled()
-            results = [TranslationResult.model_validate(item) for item in raw_results]
-            result_ids = [item.id for item in results]
-            expected_ids = {item.id for item in inputs}
-            duplicate_ids = {item_id for item_id, count in Counter(result_ids).items() if count > 1}
-            missing_ids = expected_ids - set(result_ids)
-            unknown_ids = set(result_ids) - expected_ids
-            if duplicate_ids or missing_ids or unknown_ids or len(results) != len(inputs):
-                raise ValueError(
-                    "invalid translation IDs "
-                    f"(missing={sorted(map(str, missing_ids))}, "
-                    f"duplicate={sorted(map(str, duplicate_ids))}, "
-                    f"unknown={sorted(map(str, unknown_ids))})"
-                )
-        except WorkflowCancelled:
-            raise
-        except Exception as error:
-            token.raise_if_cancelled()
-            issues.append(
-                WorkflowIssue(
-                    stage="translation",
-                    message=str(error),
-                    recoverable=bool(getattr(error, "recoverable", True)),
-                )
-            )
-            return
+        items_by_page: dict[UUID, list[tuple[TextBlock, SourceLanguage]]] = {}
+        for block, language in items:
+            items_by_page.setdefault(block.page_id, []).append((block, language))
 
-        by_id = {item.id: item for item in results}
-        for current, (block, _) in enumerate(items, 1):
+        current = 0
+        for page in project.pages:
+            page_items = items_by_page.get(page.id, [])
+            if not page_items:
+                continue
             token.raise_if_cancelled()
-            translated = by_id[block.id]
-            block.translated_text = translated.translated_text
-            block.note = translated.note
-            block.status = BlockStatus.TRANSLATED
-            block.updated_at = utc_now()
-            self._progress(
-                on_progress,
-                "translation",
-                current,
-                len(items),
-                "Translation complete",
-                page_id=block.page_id,
-                block_id=block.id,
-            )
+            inputs = [
+                TranslationInput(
+                    id=block.id,
+                    source_language=language,
+                    source_text=block.source_text,
+                    reading_order=block.reading_order,
+                )
+                for block, language in page_items
+            ]
+            try:
+                raw_results = await self._translation_provider.translate_blocks(inputs, context)
+                token.raise_if_cancelled()
+                results = [TranslationResult.model_validate(item) for item in raw_results]
+                result_ids = [item.id for item in results]
+                expected_ids = {item.id for item in inputs}
+                duplicate_ids = {
+                    item_id for item_id, count in Counter(result_ids).items() if count > 1
+                }
+                missing_ids = expected_ids - set(result_ids)
+                unknown_ids = set(result_ids) - expected_ids
+                if duplicate_ids or missing_ids or unknown_ids or len(results) != len(inputs):
+                    raise ValueError(
+                        "invalid translation IDs "
+                        f"(missing={sorted(map(str, missing_ids))}, "
+                        f"duplicate={sorted(map(str, duplicate_ids))}, "
+                        f"unknown={sorted(map(str, unknown_ids))})"
+                    )
+            except WorkflowCancelled:
+                raise
+            except Exception as error:
+                token.raise_if_cancelled()
+                issues.append(
+                    WorkflowIssue(
+                        stage="translation",
+                        message=str(error),
+                        page_id=page.id,
+                        recoverable=bool(getattr(error, "recoverable", True)),
+                    )
+                )
+                for block, _ in page_items:
+                    token.raise_if_cancelled()
+                    current += 1
+                    self._progress(
+                        on_progress,
+                        "translation",
+                        current,
+                        len(items),
+                        "Translation failed; page unchanged",
+                        page_id=page.id,
+                        block_id=block.id,
+                    )
+                continue
+
+            by_id = {item.id: item for item in results}
+            for block, _ in page_items:
+                token.raise_if_cancelled()
+                translated = by_id[block.id]
+                block.translated_text = translated.translated_text
+                block.note = translated.note
+                block.status = BlockStatus.TRANSLATED
+                block.updated_at = utc_now()
+                current += 1
+                self._progress(
+                    on_progress,
+                    "translation",
+                    current,
+                    len(items),
+                    "Translation complete",
+                    page_id=page.id,
+                    block_id=block.id,
+                )
 
     @staticmethod
     def _image_input(page: Page, project_dir: str | Path | None) -> ImageInput:

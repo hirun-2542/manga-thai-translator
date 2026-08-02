@@ -1354,8 +1354,8 @@ class MainWindow(QMainWindow):
             self._append_log(self._format_export_issue(issue))
         for warning in result.overflow_warnings:
             self._append_log(
-                f"Overflow warning: {warning.message} "
-                f"(page={warning.page_id}, block={warning.block_id})"
+                f"Overflow warning: {warning.message}"
+                f"{self._format_location(warning.page_id, warning.block_id)}"
             )
         message = (
             f"Export completed with {len(result.issues)} issue(s) and "
@@ -1371,8 +1371,8 @@ class MainWindow(QMainWindow):
             self._append_log(self._format_export_issue(issue))
         for warning in warnings:
             self._append_log(
-                f"Overflow warning: {warning.message} "
-                f"(page={warning.page_id}, block={warning.block_id})"
+                f"Overflow warning: {warning.message}"
+                f"{self._format_location(warning.page_id, warning.block_id)}"
             )
         if self._current_page_id == page_id:
             try:
@@ -1507,25 +1507,35 @@ class MainWindow(QMainWindow):
     def _append_log(self, message: str) -> None:
         self.workflow_log.appendPlainText(message)
 
-    @staticmethod
-    def _format_issue(issue: WorkflowIssue) -> str:
+    def _format_location(self, page_id: UUID | None, block_id: UUID | None) -> str:
         location = []
-        if issue.page_id is not None:
-            location.append(f"page={issue.page_id}")
-        if issue.block_id is not None:
-            location.append(f"block={issue.block_id}")
-        suffix = f" ({', '.join(location)})" if location else ""
-        return f"{issue.stage.title()} issue: {issue.message}{suffix}"
+        page = None
+        if self._project is not None and page_id is not None:
+            for page_number, candidate in enumerate(self._project.pages, 1):
+                if candidate.id == page_id:
+                    page = candidate
+                    location.append(f"Page {page_number}")
+                    break
+        if page is not None and block_id is not None:
+            block = next((item for item in page.blocks if item.id == block_id), None)
+            if block is not None:
+                location.append(f"Block {block.reading_order}")
+        if page_id is not None:
+            location.append(f"page_id={page_id}")
+        if block_id is not None:
+            location.append(f"block_id={block_id}")
+        return f" ({', '.join(location)})" if location else ""
 
-    @staticmethod
-    def _format_export_issue(issue: ExportIssue) -> str:
-        location = []
-        if issue.page_id is not None:
-            location.append(f"page={issue.page_id}")
-        if issue.block_id is not None:
-            location.append(f"block={issue.block_id}")
-        suffix = f" ({', '.join(location)})" if location else ""
-        return f"Export issue: {issue.message}{suffix}"
+    def _format_issue(self, issue: WorkflowIssue) -> str:
+        return (
+            f"{issue.stage.title()} issue: {issue.message}"
+            f"{self._format_location(issue.page_id, issue.block_id)}"
+        )
+
+    def _format_export_issue(self, issue: ExportIssue) -> str:
+        return (
+            f"Export issue: {issue.message}{self._format_location(issue.page_id, issue.block_id)}"
+        )
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._workflow_worker is not None:
