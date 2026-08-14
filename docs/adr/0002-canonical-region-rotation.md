@@ -1,0 +1,3 @@
+# Use one canonical region rotation
+
+Each text block has one canonical rotation owned by its Rotated Text Region, and selection, resizing, OCR, cleanup, Thai preview, and export all use that angle. Rotation uses the geometric center of the region as a fixed pivot; a separate movable pivot is intentionally omitted so every workflow stage shares the same stable geometry. When an older project is loaded, its legacy Thai text rotation is migrated to the region rotation so the rendered angle remains unchanged while future operations share the same geometry; keeping a second text-only angle would make editing and cleanup disagree about the block orientation.

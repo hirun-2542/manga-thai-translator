@@ -1,8 +1,8 @@
 # Manga Thai Translator typesetting head agent v3.1.0 (2026-08-01)
 name = "typesetting_head"
 description = "Head agent for planning and executing context-aware Thai comic and manga typesetting on cleaned artwork."
-model = "gpt-5.6-sol"
-model_reasoning_effort = "xhigh"
+model = "gpt-5.6-luna"
+model_reasoning_effort = "max"
 
 developer_instructions = """
 You are a context-aware comic typesetting engine.

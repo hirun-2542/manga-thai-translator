@@ -2,8 +2,10 @@
 
 from collections import Counter
 from collections.abc import Callable, Iterable
+from contextlib import contextmanager
 from pathlib import Path
-from threading import Event
+from tempfile import TemporaryDirectory
+from threading import Event, Lock
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -13,6 +15,7 @@ from app.core.coordinates import clamp_bbox
 from app.core.language import resolve_source_language
 from app.core.models import (
     BlockStatus,
+    BoundingBox,
     Page,
     Project,
     SourceLanguage,
@@ -22,6 +25,7 @@ from app.core.models import (
     TranslationResult,
     utc_now,
 )
+from app.services.ocr._image import load_rotated_crop
 from app.services.ocr.base import OcrProvider
 from app.services.text_detection.base import TextDetectionProvider
 from app.services.translation.base import TranslationProvider
@@ -30,6 +34,21 @@ from app.services.types import ImageInput
 type WorkflowStage = Literal["detection", "ocr", "translation"]
 type WorkflowMode = Literal["end_to_end", "ocr", "translate"]
 type ProgressCallback = Callable[["ProgressUpdate"], None]
+
+
+@contextmanager
+def _ocr_region_input(image: ImageInput, block: TextBlock):
+    if block.rotation_degrees == 0.0:
+        yield image, block.bbox
+        return
+    crop = load_rotated_crop(image, block.bbox, block.rotation_degrees)
+    with TemporaryDirectory(prefix="manga-thai-ocr-") as directory:
+        path = Path(directory) / "region.png"
+        crop.save(path, format="PNG")
+        yield (
+            ImageInput(path=path, width=crop.width, height=crop.height),
+            BoundingBox(x=0, y=0, width=crop.width, height=crop.height),
+        )
 
 
 class WorkflowCancelled(RuntimeError):
@@ -96,6 +115,31 @@ class WorkflowService:
         self._detector = detector
         self._ocr_provider = ocr_provider
         self._translation_provider = translation_provider
+        self._close_lock = Lock()
+        self._closed = False
+
+    def close(self) -> None:
+        """Close providers once, including native subprocess-backed providers."""
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+        first_error: Exception | None = None
+        seen: set[int] = set()
+        for provider in (self._detector, self._ocr_provider, self._translation_provider):
+            if id(provider) in seen:
+                continue
+            seen.add(id(provider))
+            close = getattr(provider, "close", None)
+            if not callable(close):
+                continue
+            try:
+                close()
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise RuntimeError("workflow provider close failed") from first_error
 
     async def run(
         self,
@@ -345,7 +389,12 @@ class WorkflowService:
     ) -> bool:
         token.raise_if_cancelled()
         try:
-            recognized = await self._ocr_provider.recognize(image, block.bbox, language)
+            with _ocr_region_input(image, block) as (ocr_image, ocr_bbox):
+                recognized = await self._ocr_provider.recognize(
+                    ocr_image,
+                    ocr_bbox,
+                    language,
+                )
             token.raise_if_cancelled()
         except WorkflowCancelled:
             raise
@@ -457,7 +506,7 @@ class WorkflowService:
             for block, _ in page_items:
                 token.raise_if_cancelled()
                 translated = by_id[block.id]
-                block.translated_text = translated.translated_text
+                block.translated_text = " ".join(translated.translated_text.splitlines())
                 block.note = translated.note
                 block.status = BlockStatus.TRANSLATED
                 block.updated_at = utc_now()

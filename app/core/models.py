@@ -7,12 +7,13 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 type NonEmptyString = Annotated[str, Field(min_length=1)]
 type NonNegativeInt = Annotated[int, Field(ge=0)]
 type PositiveInt = Annotated[int, Field(gt=0)]
 type Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
+type RgbHexColor = Annotated[str, Field(pattern=r"^#[0-9A-Fa-f]{6}$")]
 
 
 def utc_now() -> datetime:
@@ -38,6 +39,12 @@ class ReadingOrderPreset(StrEnum):
 class WritingMode(StrEnum):
     HORIZONTAL = "horizontal"
     VERTICAL = "vertical"
+
+
+class TextAlignment(StrEnum):
+    LEFT = "left"
+    CENTER = "center"
+    RIGHT = "right"
 
 
 class BlockStatus(StrEnum):
@@ -76,6 +83,17 @@ class TextBlock(DomainModel):
     writing_mode: WritingMode = WritingMode.HORIZONTAL
     source_text: str = ""
     translated_text: str = ""
+    typesetting_font_family: Annotated[str, Field(min_length=1)] | None = None
+    typesetting_font_style: Annotated[str, Field(min_length=1)] | None = None
+    typesetting_fill_color: RgbHexColor | None = None
+    typesetting_stroke_color: RgbHexColor | None = None
+    typesetting_stroke_width: Annotated[int, Field(ge=0, le=32)] | None = 0
+    typesetting_font_size: Annotated[int, Field(ge=8, le=256)] | None = None
+    typesetting_line_spacing: Annotated[int, Field(ge=0, le=256)] | None = None
+    typesetting_alignment: TextAlignment = TextAlignment.CENTER
+    rotation_degrees: Annotated[float, Field(ge=-180.0, le=180.0)] = 0.0
+    mirror_horizontal: bool = False
+    mirror_vertical: bool = False
     ocr_confidence: Confidence | None = None
     ocr_provider: str | None = None
     speaker: str = ""
@@ -86,6 +104,12 @@ class TextBlock(DomainModel):
 
     _created_at_utc = field_validator("created_at")(_as_utc)
     _updated_at_utc = field_validator("updated_at")(_as_utc)
+
+    @model_validator(mode="after")
+    def validate_typesetting_font_override(self) -> "TextBlock":
+        if self.typesetting_font_style is not None and self.typesetting_font_family is None:
+            raise ValueError("typesetting_font_style requires typesetting_font_family")
+        return self
 
     @model_validator(mode="after")
     def validate_timestamp_order(self) -> "TextBlock":
@@ -173,7 +197,7 @@ class ProviderConfiguration(DomainModel):
 
 
 class Project(DomainModel):
-    schema_version: Literal[1] = SCHEMA_VERSION
+    schema_version: Literal[2] = SCHEMA_VERSION
     id: UUID = Field(default_factory=uuid4)
     name: NonEmptyString
     settings: ProjectSettings = Field(default_factory=ProjectSettings)

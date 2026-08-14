@@ -132,6 +132,8 @@ class FolderTranslationService:
         )
         token.raise_if_cancelled()
         blocks = [TextBlock.model_validate(item).model_copy(deep=True) for item in raw_blocks]
+        for block in blocks:
+            block.translated_text = " ".join(block.translated_text.splitlines())
         if any(block.page_id != page.id for block in blocks):
             raise ValueError("provider returned a block for the wrong page")
         if any(block.status is not BlockStatus.TRANSLATED for block in blocks):

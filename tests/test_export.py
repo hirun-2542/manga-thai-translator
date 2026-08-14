@@ -1,3 +1,4 @@
+import builtins
 import csv
 import json
 import os
@@ -15,15 +16,21 @@ from app.core.models import (
     Project,
     ProjectSettings,
     SourceLanguage,
+    TextAlignment,
     TextBlock,
     WritingMode,
 )
-from app.services.export import ExportProgress, ExportService
+from app.services.export import ExportProgress, ExportService, RenderMetric
+from app.services.system_fonts import FontResolutionError, SystemFont
 from app.services.workflow import CancellationToken, WorkflowCancelled
 
 
 def _font_path() -> Path:
     return Path(ImageFont.truetype("NotoSans-Regular.ttf", 12).path)
+
+
+def _thai_font_path() -> Path:
+    return Path(ImageFont.truetype("NotoSansThai-Regular.ttf", 12).path)
 
 
 def make_page(
@@ -99,6 +106,7 @@ def test_structured_exports_are_complete_ordered_and_utf8(tmp_path: Path) -> Non
                 "note": "หมายเหตุ",
                 "status": BlockStatus.TRANSLATION_REVIEWED,
                 "writing_mode": WritingMode.VERTICAL,
+                "typesetting_alignment": TextAlignment.RIGHT,
             },
         ],
         language=SourceLanguage.KO,
@@ -122,6 +130,10 @@ def test_structured_exports_are_complete_ordered_and_utf8(tmp_path: Path) -> Non
         _font_path(),
     )
 
+    assert result.preview_paths == (
+        tmp_path / "exports" / "1.png",
+        tmp_path / "exports" / "2.png",
+    )
     assert json.loads(result.json_path.read_text(encoding="utf-8")) == project.model_dump(
         mode="json"
     )
@@ -141,10 +153,14 @@ def test_structured_exports_are_complete_ordered_and_utf8(tmp_path: Path) -> Non
         "note",
         "status",
         "writing_mode",
+        "text_alignment",
         "bbox_x",
         "bbox_y",
         "bbox_width",
         "bbox_height",
+        "rotation_degrees",
+        "mirror_horizontal",
+        "mirror_vertical",
     ]
     assert [row["reading_order"] for row in rows] == ["2", "10", "1"]
     assert rows[0]["source_language"] == "ko"
@@ -154,6 +170,7 @@ def test_structured_exports_are_complete_ordered_and_utf8(tmp_path: Path) -> Non
     assert rows[0]["speaker"] == "นางเอก"
     assert rows[0]["status"] == "translation_reviewed"
     assert rows[0]["writing_mode"] == "vertical"
+    assert rows[0]["text_alignment"] == "right"
     assert '"' in result.csv_path.read_text(encoding="utf-8")
     text = result.txt_path.read_text(encoding="utf-8")
     assert text.index("[2] Source:") < text.index("[10] Source:") < text.index("Page 2:")
@@ -202,6 +219,152 @@ def test_preview_preserves_dimensions_source_and_marks_only_overflow(
         assert preview.getpixel((100, 100)) == (0, 128, 0)
 
 
+def test_export_text_watermark_is_drawn_at_bottom_right(tmp_path: Path) -> None:
+    source = tmp_path / "watermark-source.png"
+    original = Image.new("RGB", (600, 400), "white")
+    original.save(source)
+    page = Page(source_path=str(source), width=600, height=400)
+
+    result = ExportService.export(
+        Project(name="watermark", pages=[page]),
+        tmp_path,
+        tmp_path / "out",
+        _font_path(),
+        watermark_text="แปลหลังเลิกงาน",
+    )
+
+    with Image.open(result.preview_paths[0]) as exported:
+        difference = ImageChops.difference(original, exported.convert("RGB"))
+        bounds = difference.getbbox()
+    assert bounds is not None
+    assert bounds[0] > original.width // 2
+    assert bounds[1] > original.height // 2
+
+
+def test_export_transparent_logo_scales_down_without_covering_transparent_pixels(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "logo-source.png"
+    Image.new("RGB", (1000, 500), "white").save(source)
+    logo_path = tmp_path / "logo.png"
+    logo = Image.new("RGBA", (400, 100), (0, 0, 0, 0))
+    ImageDraw.Draw(logo).rectangle((200, 0, 399, 99), fill=(255, 0, 0, 255))
+    logo.save(logo_path)
+    page = Page(source_path=str(source), width=1000, height=500)
+
+    result = ExportService.export(
+        Project(name="logo", pages=[page]),
+        tmp_path,
+        tmp_path / "out",
+        _font_path(),
+        watermark_logo_path=logo_path,
+    )
+
+    with Image.open(result.preview_paths[0]) as exported:
+        image = exported.convert("RGB")
+        assert image.getpixel((800, 460)) == (255, 255, 255)
+        assert image.getpixel((940, 460))[0] > 240
+        assert image.getpixel((940, 460))[1:] == (0, 0)
+
+
+@pytest.mark.parametrize("position", ["start", "end"])
+def test_export_banner_is_numbered_as_first_or_last_page(
+    tmp_path: Path,
+    position: str,
+) -> None:
+    first_source = tmp_path / "first.png"
+    second_source = tmp_path / "second.png"
+    save_image(first_source, "blue")
+    save_image(second_source, "green")
+    banner = tmp_path / "banner.webp"
+    Image.new("RGB", (90, 40), "orange").save(banner)
+    progress: list[ExportProgress] = []
+
+    result = ExportService.export(
+        Project(
+            name="banner",
+            pages=[make_page(first_source, 31), make_page(second_source, 32)],
+        ),
+        tmp_path,
+        tmp_path / "out",
+        _font_path(),
+        banner_path=banner,
+        banner_position=position,
+        on_progress=progress.append,
+    )
+
+    assert [path.name for path in result.preview_paths] == ["1.png", "2.png", "3.png"]
+    banner_index = 0 if position == "start" else 2
+    with Image.open(result.preview_paths[banner_index]) as exported_banner:
+        assert exported_banner.size == (90, 40)
+        assert exported_banner.convert("RGB").getpixel((0, 0)) == (255, 165, 0)
+    assert [item.current for item in progress] == [1, 2, 3]
+    assert all(item.total == 3 for item in progress)
+
+
+def test_export_branding_validation_happens_before_writes(tmp_path: Path) -> None:
+    source = tmp_path / "source.png"
+    save_image(source)
+    page = make_page(source, 33)
+    logo = tmp_path / "logo.png"
+    save_image(logo)
+    invalid = tmp_path / "invalid.png"
+    invalid.write_text("not an image", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="text or logo"):
+        ExportService.export(
+            Project(name="both", pages=[page]),
+            tmp_path,
+            tmp_path / "both-out",
+            _font_path(),
+            watermark_text="mark",
+            watermark_logo_path=logo,
+        )
+    with pytest.raises(ValueError, match="invalid banner position"):
+        ExportService.export(
+            Project(name="position", pages=[page]),
+            tmp_path,
+            tmp_path / "position-out",
+            _font_path(),
+            banner_path=logo,
+            banner_position="middle",
+        )
+    with pytest.raises(ValueError, match="invalid watermark logo"):
+        ExportService.export(
+            Project(name="invalid", pages=[page]),
+            tmp_path,
+            tmp_path / "invalid-out",
+            _font_path(),
+            watermark_logo_path=invalid,
+        )
+
+    assert not (tmp_path / "both-out").exists()
+    assert not (tmp_path / "position-out").exists()
+    assert not (tmp_path / "invalid-out").exists()
+
+
+def test_banner_source_collision_is_rejected_before_writes(tmp_path: Path) -> None:
+    source = tmp_path / "source.png"
+    save_image(source)
+    output = tmp_path / "out"
+    output.mkdir()
+    banner = output / "1.png"
+    original = save_image(banner, "orange")
+
+    with pytest.raises(ValueError, match="overwrite a source"):
+        ExportService.export(
+            Project(name="collision", pages=[make_page(source, 34)]),
+            tmp_path,
+            output,
+            _font_path(),
+            banner_path=banner,
+            banner_position="start",
+        )
+
+    assert banner.read_bytes() == original
+    assert sorted(output.iterdir()) == [banner]
+
+
 def test_thai_graphemes_and_explicit_newlines_are_not_split() -> None:
     assert ExportService._graphemes("กำลัง") == ["กำ", "ลั", "ง"]
     assert ExportService._graphemes("e\u0301😀") == ["e\u0301", "😀"]
@@ -214,6 +377,35 @@ def test_thai_graphemes_and_explicit_newlines_are_not_split() -> None:
     assert lines[:2] == ["กำ", "กำ"]
     assert "".join(lines[:2]) == "กำกำ"
     assert lines[2:] and "".join(lines[2:]) == "ไทย"
+
+
+def test_thai_wrapping_prefers_qt_word_boundaries() -> None:
+    font = ImageFont.truetype(_font_path(), 20)
+    draw = ImageDraw.Draw(Image.new("RGB", (200, 100)))
+    width = int(draw.textlength("ภาษา", font=font)) + 1
+
+    lines = ExportService._wrap_text(draw, "ภาษาไทยดีมาก", font, width)
+
+    assert lines == ["ภาษา", "ไทย", "ดี", "มาก"]
+
+
+def test_mixed_thai_and_latin_wrapping_preserves_latin_whitespace() -> None:
+    font = ImageFont.truetype(_font_path(), 20)
+    draw = ImageDraw.Draw(Image.new("RGB", (200, 100)))
+    width = int(draw.textlength("ภาษา", font=font)) + 1
+
+    lines = ExportService._wrap_text(draw, "ภาษาไทย hello", font, width)
+
+    assert lines == ["ภาษา", "ไทย", "hello"]
+
+
+def test_overwide_thai_word_falls_back_to_grapheme_clusters() -> None:
+    font = ImageFont.truetype(_font_path(), 20)
+    draw = ImageDraw.Draw(Image.new("RGB", (200, 100)))
+
+    lines = ExportService._wrap_text(draw, "กำลัง", font, 1)
+
+    assert lines == ExportService._graphemes("กำลัง")
 
 
 def test_single_page_preview_centers_and_fits_text_beyond_48px(tmp_path: Path) -> None:
@@ -238,7 +430,7 @@ def test_single_page_preview_centers_and_fits_text_beyond_48px(tmp_path: Path) -
     assert abs((ink[1] + ink[3]) / 2 - 50) <= 3
 
 
-def test_flat_textured_preview_inpaints_colored_glyphs_without_a_halo(tmp_path: Path) -> None:
+def test_flat_textured_preview_uses_solid_ring_median_without_a_halo(tmp_path: Path) -> None:
     source = tmp_path / "pattern.png"
     ring_color = (210, 230, 240)
     original_image = Image.new("RGB", (160, 120), ring_color)
@@ -285,10 +477,7 @@ def test_flat_textured_preview_inpaints_colored_glyphs_without_a_halo(tmp_path: 
         assert glyph_pixels
         assert all(preview.getpixel(point) != unchanged.getpixel(point) for point in glyph_pixels)
         untouched_texture = [(x, y) for y in range(22, 40) for x in range(110, 120)]
-        assert all(
-            preview.getpixel(point) == unchanged.getpixel(point) for point in untouched_texture
-        )
-        assert len({preview.getpixel(point) for point in untouched_texture}) > 1
+        assert all(preview.getpixel(point) == (210, 230, 240) for point in untouched_texture)
         thai_region = {preview.getpixel((x, y)) for y in range(25, 85) for x in range(65, 95)}
         assert (0, 0, 0) in thai_region
         assert (255, 255, 255) not in thai_region
@@ -371,7 +560,11 @@ def test_smooth_high_variance_gradient_is_cleanup_safe(tmp_path: Path) -> None:
     original.paste((90, 220, 245), mask=glyph_mask)
     original.save(source)
     bbox = BoundingBox(x=30, y=20, width=100, height=80)
-    page = make_page(source, 22, [{"bbox": bbox, "translated_text": "ไ"}])
+    page = make_page(
+        source,
+        22,
+        [{"bbox": bbox, "translated_text": "ไ", "typesetting_stroke_width": None}],
+    )
     destination = tmp_path / "gradient-preview.png"
 
     assert max(ImageStat.Stat(original).stddev) > 35
@@ -439,9 +632,15 @@ def test_smooth_high_variance_gradient_is_cleanup_safe(tmp_path: Path) -> None:
 
     assert warnings == issues == ()
     with Image.open(destination) as preview:
-        assert (0, 0, 0) in {
-            preview.getpixel((x, y)) for y in range(20, 100) for x in range(30, 130)
-        }
+        assert any(
+            max(
+                abs(preview.getpixel((x, y))[channel] - cleaned.getpixel((x - 26, y - 16))[channel])
+                for channel in range(3)
+            )
+            >= 50
+            for y in range(20, 100)
+            for x in range(30, 130)
+        )
         assert all(
             preview.getpixel((x, y)) == original.getpixel((x, y))
             for y in range(original.height)
@@ -527,7 +726,11 @@ def test_manual_cleanup_override_typesets_complex_block_only(tmp_path: Path) -> 
     original = save_complex_image(source)
     original_bytes = source.read_bytes()
     bbox = BoundingBox(x=130, y=70, width=60, height=70)
-    page = make_page(source, 24, [{"bbox": bbox, "translated_text": "ไ"}])
+    page = make_page(
+        source,
+        24,
+        [{"bbox": bbox, "translated_text": "ไ", "typesetting_stroke_width": None}],
+    )
     override_path = tmp_path / "cleanups" / f"page-{page.id}" / f"block-{page.blocks[0].id}.png"
     override_path.parent.mkdir(parents=True)
     Image.new("L", (46, 66), 25).save(override_path)
@@ -542,25 +745,565 @@ def test_manual_cleanup_override_typesets_complex_block_only(tmp_path: Path) -> 
     assert result.overflow_warnings == result.issues == ()
     assert source.read_bytes() == original_bytes
     with Image.open(result.preview_paths[0]) as preview:
-        rendered_colors = {
-            preview.getpixel((x, y)) for y in range(70, 120) for x in range(130, 160)
+        rendered_levels = {
+            sum(preview.getpixel((x, y))) for y in range(70, 120) for x in range(130, 160)
         }
-        assert (255, 255, 255) in rendered_colors
-        assert (0, 0, 0) in rendered_colors
-        assert preview.getpixel((114, 54)) == (25, 25, 25)
-        assert preview.getpixel((114, 54)) != original.getpixel((114, 54))
-        assert all(
-            preview.getpixel((x, y)) == (25, 25, 25)
-            for y in range(54, 120)
-            for x in range(114, 160)
-            if not (130 <= x < 160 and 70 <= y < 120)
-        )
+        assert max(rendered_levels) - sum((25, 25, 25)) >= 300
+        assert preview.getpixel((114, 54)) == (40, 80, 120)
         assert all(
             preview.getpixel((x, y)) == original.getpixel((x, y))
             for y in range(original.height)
             for x in range(original.width)
-            if not (114 <= x < 160 and 54 <= y < 120)
+            if not (130 <= x < 160 and 70 <= y < 120)
         )
+
+
+def test_preview_reuses_source_text_color_stroke_and_height(tmp_path: Path) -> None:
+    source = tmp_path / "styled.png"
+    background = (40, 170, 230)
+    fill = (245, 250, 255)
+    stroke = (15, 85, 120)
+    original = Image.new("RGB", (160, 120), background)
+    bbox = BoundingBox(x=30, y=25, width=100, height=65)
+    ImageDraw.Draw(original).text(
+        (47, 31),
+        "EN",
+        font=ImageFont.truetype(_font_path(), 44),
+        fill=fill,
+        stroke_width=3,
+        stroke_fill=stroke,
+    )
+    original.save(source)
+    page = make_page(
+        source,
+        25,
+        [{"bbox": bbox, "source_text": "EN", "translated_text": "ไ"}],
+    )
+    block = page.blocks[0]
+    override = tmp_path / "cleanups" / f"page-{page.id}" / f"block-{block.id}.png"
+    override.parent.mkdir(parents=True)
+    Image.new("RGB", (132, 97), background).save(override)
+    destination = tmp_path / "styled-preview.png"
+
+    warnings, issues = ExportService.render_page_preview(
+        page,
+        tmp_path,
+        destination,
+        _font_path(),
+        clean_background=True,
+    )
+
+    assert warnings == issues == ()
+    style = ExportService._estimate_source_text_style(original, (30, 25, 130, 90), "EN")
+    assert style is not None
+    assert max(abs(style[0][index] - fill[index]) for index in range(3)) <= 12
+    assert style[1] is not None
+    assert max(abs(style[1][index] - stroke[index]) for index in range(3)) <= 20
+    assert 35 <= style[3] <= 55
+    with Image.open(destination) as preview:
+        rendered = preview.crop((30, 25, 130, 90))
+        colors = rendered.getcolors(maxcolors=rendered.width * rendered.height) or []
+        assert any(
+            max(abs(color[index] - fill[index]) for index in range(3)) <= 12
+            for _count, color in colors
+        )
+
+
+def test_preview_emits_selected_runtime_render_metric(tmp_path: Path) -> None:
+    source = tmp_path / "metric.png"
+    save_image(source, "white")
+    page = make_page(
+        source,
+        28,
+        [
+            {
+                "bbox": BoundingBox(x=30, y=20, width=100, height=80),
+                "translated_text": "ไ",
+                "typesetting_font_size": 24,
+            }
+        ],
+    )
+    metrics: list[RenderMetric] = []
+
+    warnings, issues = ExportService.render_page_preview(
+        page,
+        tmp_path,
+        tmp_path / "metric-preview.png",
+        _font_path(),
+        on_metric=metrics.append,
+    )
+
+    assert warnings == issues == ()
+    assert metrics == [
+        RenderMetric(
+            block_id=page.blocks[0].id,
+            font_size_px=24,
+            fill_rgb=(0, 0, 0),
+            stroke_rgb=None,
+            font_label=_font_path().name,
+            stroke_width_px=0,
+        )
+    ]
+
+
+def test_preview_applies_block_color_and_stroke_overrides(tmp_path: Path) -> None:
+    source = tmp_path / "override.png"
+    save_image(source, "white")
+    page = make_page(
+        source,
+        281,
+        [
+            {
+                "bbox": BoundingBox(x=20, y=20, width=100, height=80),
+                "translated_text": "ไ",
+                "typesetting_fill_color": "#102030",
+                "typesetting_stroke_color": "#A0B0C0",
+                "typesetting_stroke_width": 0,
+            }
+        ],
+    )
+    metrics: list[RenderMetric] = []
+
+    warnings, issues = ExportService.render_page_preview(
+        page,
+        tmp_path,
+        tmp_path / "override-preview.png",
+        _font_path(),
+        on_metric=metrics.append,
+    )
+
+    assert warnings == issues == ()
+    assert metrics[0].fill_rgb == (16, 32, 48)
+    assert metrics[0].stroke_rgb is None
+    assert metrics[0].stroke_width_px == 0
+
+
+def test_preview_treats_legacy_none_stroke_width_as_zero(tmp_path: Path) -> None:
+    source = tmp_path / "stroke-auto.png"
+    save_image(source, "white")
+    page = make_page(
+        source,
+        282,
+        [
+            {
+                "bbox": BoundingBox(x=20, y=20, width=100, height=80),
+                "translated_text": "ไ",
+                "typesetting_stroke_color": "#A0B0C0",
+                "typesetting_stroke_width": None,
+            }
+        ],
+    )
+    metrics: list[RenderMetric] = []
+
+    warnings, issues = ExportService.render_page_preview(
+        page,
+        tmp_path,
+        tmp_path / "stroke-auto-preview.png",
+        _font_path(),
+        on_metric=metrics.append,
+    )
+
+    assert warnings == issues == ()
+    assert metrics[0].stroke_rgb is None
+    assert metrics[0].stroke_width_px == 0
+
+
+def test_preview_keeps_explicit_positive_stroke_width(tmp_path: Path) -> None:
+    source = tmp_path / "stroke-positive.png"
+    save_image(source, "white")
+    page = make_page(
+        source,
+        285,
+        [
+            {
+                "bbox": BoundingBox(x=20, y=20, width=100, height=80),
+                "translated_text": "ไ",
+                "typesetting_stroke_color": "#A0B0C0",
+                "typesetting_stroke_width": 3,
+            }
+        ],
+    )
+    metrics: list[RenderMetric] = []
+
+    warnings, issues = ExportService.render_page_preview(
+        page,
+        tmp_path,
+        tmp_path / "stroke-positive-preview.png",
+        _font_path(),
+        on_metric=metrics.append,
+    )
+
+    assert warnings == issues == ()
+    assert metrics[0].stroke_rgb == (160, 176, 192)
+    assert metrics[0].stroke_width_px == 3
+
+
+def test_missing_block_font_falls_back_with_recoverable_issue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "missing-font.png"
+    save_image(source, "white")
+    page = make_page(
+        source,
+        283,
+        [
+            {
+                "bbox": BoundingBox(x=20, y=20, width=100, height=80),
+                "translated_text": "ไ",
+                "typesetting_font_family": "Missing Family",
+                "typesetting_font_style": "Regular",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "app.services.export.service.resolve_system_font",
+        lambda *_args: (_ for _ in ()).throw(FontResolutionError("not installed")),
+    )
+    metrics: list[RenderMetric] = []
+
+    warnings, issues = ExportService.render_page_preview(
+        page,
+        tmp_path,
+        tmp_path / "missing-font-preview.png",
+        _font_path(),
+        on_metric=metrics.append,
+    )
+
+    assert warnings == ()
+    assert len(issues) == 1
+    assert str(page.blocks[0].id) in issues[0].message
+    assert issues[0].recoverable
+    assert metrics[0].font_label == _font_path().name
+
+
+def test_preview_applies_successful_block_font_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "override-font.png"
+    save_image(source, "white")
+    page = make_page(
+        source,
+        284,
+        [
+            {
+                "bbox": BoundingBox(x=20, y=20, width=100, height=80),
+                "translated_text": "ไ",
+                "typesetting_font_family": "Test Thai",
+                "typesetting_font_style": "Bold",
+            }
+        ],
+    )
+    fake_font = SystemFont(
+        family="Test Thai",
+        style="Bold",
+        path=_font_path(),
+        display_label="Test Thai / Bold",
+    )
+    monkeypatch.setattr(
+        "app.services.export.service.resolve_system_font",
+        lambda *_args: fake_font,
+    )
+    monkeypatch.setattr(
+        "app.services.export.service.load_pillow_font",
+        lambda _font, size: ImageFont.truetype(_font_path(), size),
+    )
+    metrics: list[RenderMetric] = []
+
+    warnings, issues = ExportService.render_page_preview(
+        page,
+        tmp_path,
+        tmp_path / "override-font-preview.png",
+        _font_path(),
+        clean_background=False,
+        on_metric=metrics.append,
+    )
+
+    assert warnings == issues == ()
+    assert metrics[0].font_label == "Test Thai / Bold"
+
+
+def test_preview_applies_exact_font_size_and_clockwise_rotation(tmp_path: Path) -> None:
+    source = tmp_path / "typesetting.png"
+    Image.new("RGB", (160, 120), "white").save(source)
+    bbox = BoundingBox(x=30, y=20, width=100, height=80)
+
+    def render(font_size: int, rotation: float, name: str) -> tuple[int, int]:
+        page = make_page(
+            source,
+            26,
+            [
+                {
+                    "bbox": bbox,
+                    "translated_text": "ไ",
+                    "typesetting_font_size": font_size,
+                    "rotation_degrees": rotation,
+                }
+            ],
+        )
+        destination = tmp_path / name
+        warnings, issues = ExportService.render_page_preview(
+            page,
+            tmp_path,
+            destination,
+            _font_path(),
+            clean_background=False,
+        )
+        assert warnings == issues == ()
+        with Image.open(destination) as preview:
+            difference = ImageChops.difference(
+                preview.crop((30, 20, 130, 100)).convert("RGB"),
+                Image.new("RGB", (100, 80), "white"),
+            )
+            bounds = difference.getbbox()
+        assert bounds is not None
+        return bounds[2] - bounds[0], bounds[3] - bounds[1]
+
+    small = render(24, 0.0, "small.png")
+    large = render(48, 0.0, "large.png")
+    rotated = render(48, 30.0, "rotated.png")
+
+    assert large[1] > small[1]
+    assert rotated != large
+
+
+def test_rotated_region_background_preserves_pixels_outside_region_polygon(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "rotated-region.png"
+    Image.new("RGB", (160, 120), "black").save(source)
+    page = make_page(
+        source,
+        261,
+        [
+            {
+                "bbox": BoundingBox(x=50, y=40, width=60, height=30),
+                "translated_text": "ไ",
+                "rotation_degrees": 45,
+            }
+        ],
+    )
+    destination = tmp_path / "rotated-region-preview.png"
+
+    warnings, issues = ExportService.render_page_preview(
+        page,
+        tmp_path,
+        destination,
+        _font_path(),
+        background_color="white",
+        clean_background=False,
+    )
+
+    assert warnings == issues == ()
+    with Image.open(destination) as preview:
+        assert preview.getpixel((48, 23)) == (0, 0, 0)
+        assert preview.getpixel((69, 30)) == (255, 255, 255)
+
+
+def test_text_mirror_axes_are_independent_and_composable() -> None:
+    arguments = ("F", 100, 80, _font_path(), "white")
+    options = {"font_size": 48, "fill_color": (0, 0, 0)}
+
+    original, _ = ExportService._render_text_box(*arguments, **options)
+    horizontal, _ = ExportService._render_text_box(
+        *arguments,
+        mirror_horizontal=True,
+        **options,
+    )
+    vertical, _ = ExportService._render_text_box(
+        *arguments,
+        mirror_vertical=True,
+        **options,
+    )
+    both, _ = ExportService._render_text_box(
+        *arguments,
+        mirror_horizontal=True,
+        mirror_vertical=True,
+        **options,
+    )
+
+    assert (
+        ImageChops.difference(
+            horizontal,
+            original.transpose(Image.Transpose.FLIP_LEFT_RIGHT),
+        ).getbbox()
+        is None
+    )
+    assert (
+        ImageChops.difference(
+            vertical,
+            original.transpose(Image.Transpose.FLIP_TOP_BOTTOM),
+        ).getbbox()
+        is None
+    )
+    assert (
+        ImageChops.difference(
+            both,
+            original.transpose(Image.Transpose.FLIP_LEFT_RIGHT).transpose(
+                Image.Transpose.FLIP_TOP_BOTTOM
+            ),
+        ).getbbox()
+        is None
+    )
+
+
+def test_text_alignment_moves_rendered_text_within_local_region() -> None:
+    bounds = []
+    for alignment in TextAlignment:
+        rendered, overflow = ExportService._render_text_box(
+            "M\nI",
+            160,
+            100,
+            _font_path(),
+            "white",
+            fill_color=(0, 0, 0),
+            font_size=32,
+            text_alignment=alignment,
+        )
+        assert not overflow
+        difference = ImageChops.difference(rendered, Image.new("RGB", rendered.size, "white"))
+        text_bounds = difference.getbbox()
+        assert text_bounds is not None
+        bounds.append(text_bounds)
+
+    assert bounds[0][0] < bounds[1][0] < bounds[2][0]
+    assert bounds[0][2] < bounds[1][2] < bounds[2][2]
+
+
+def test_preview_manual_line_spacing_changes_rendered_height(tmp_path: Path) -> None:
+    source = tmp_path / "line-spacing.png"
+    Image.new("RGB", (160, 160), "white").save(source)
+    bbox = BoundingBox(x=20, y=20, width=120, height=120)
+
+    def render(spacing: int | None, name: str) -> int:
+        page = make_page(
+            source,
+            29 if spacing is None else 30,
+            [
+                {
+                    "bbox": bbox,
+                    "translated_text": "ไ\nไ",
+                    "typesetting_font_size": 24,
+                    "typesetting_line_spacing": spacing,
+                }
+            ],
+        )
+        destination = tmp_path / name
+        warnings, issues = ExportService.render_page_preview(
+            page, tmp_path, destination, _font_path(), clean_background=False
+        )
+        assert warnings == issues == ()
+        with Image.open(destination) as preview:
+            difference = ImageChops.difference(
+                preview.crop((20, 20, 140, 140)).convert("RGB"),
+                Image.new("RGB", (120, 120), "white"),
+            )
+            bounds = difference.getbbox()
+        assert bounds is not None
+        return bounds[3] - bounds[1]
+
+    automatic = render(None, "automatic-spacing.png")
+    manual = render(24, "manual-spacing.png")
+    assert manual > automatic
+
+
+def test_automatic_thai_line_spacing_preserves_ink_gap_and_fits_font() -> None:
+    font = _thai_font_path()
+    metrics: list[tuple[int, tuple[int, int, int], tuple[int, int, int] | None, int]] = []
+    rendered, overflow = ExportService._render_text_box(
+        "เก้าอี้\nเก้าอี้",
+        300,
+        180,
+        font,
+        "white",
+        fill_color=(0, 0, 0),
+        font_size=48,
+    )
+    rows = [
+        y
+        for y in range(rendered.height)
+        if any(rendered.getpixel((x, y)) != (255, 255, 255) for x in range(rendered.width))
+    ]
+    line_groups: list[list[int]] = []
+    for y in rows:
+        if not line_groups or y - line_groups[-1][-1] > 5:
+            line_groups.append([y])
+        else:
+            line_groups[-1].append(y)
+
+    assert not overflow
+    assert len(line_groups) == 2
+    assert line_groups[1][0] - line_groups[0][-1] - 1 >= 16
+
+    _, overflow = ExportService._render_text_box(
+        "เก้าอี้\nเก้าอี้",
+        200,
+        126,
+        font,
+        "white",
+        fill_color=(0, 0, 0),
+        maximum_font_size=48,
+        on_metric=lambda *metric: metrics.append(metric),
+    )
+
+    assert not overflow
+    assert metrics[0][0] < 48
+
+
+def test_archive_manual_cleanups_targets_blocks_and_keeps_numbered_backups(
+    tmp_path: Path,
+) -> None:
+    page_id = UUID("00000000-0000-0000-0000-000000000001")
+    first_id = UUID("00000000-0000-0000-0000-000000000002")
+    second_id = UUID("00000000-0000-0000-0000-000000000003")
+    cleanup_dir = tmp_path / "cleanups" / f"page-{page_id}"
+    cleanup_dir.mkdir(parents=True)
+    first = cleanup_dir / f"block-{first_id}.png"
+    second = cleanup_dir / f"block-{second_id}.png"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    first.with_name(f"{first.name}.bak").write_bytes(b"older")
+
+    archived = ExportService.archive_manual_cleanups(tmp_path, page_id, (first_id, first_id))
+
+    assert archived == (first.with_name(f"{first.name}.bak2"),)
+    assert archived[0].read_bytes() == b"first"
+    assert not first.exists()
+    assert second.read_bytes() == b"second"
+    assert ExportService.archive_manual_cleanups(tmp_path, page_id, (first_id,)) == ()
+
+
+def test_prepare_manual_cleanups_creates_exact_crop_without_overwriting_edits(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.png"
+    source = Image.new("RGB", (160, 120))
+    for y in range(source.height):
+        for x in range(source.width):
+            source.putpixel((x, y), (x, y, (x + y) % 256))
+    source.save(source_path)
+    page = make_page(
+        source_path,
+        27,
+        [{"bbox": BoundingBox(x=0, y=0, width=20, height=10)}],
+    )
+    block = page.blocks[0]
+
+    paths = ExportService.prepare_manual_cleanups(page, tmp_path, (block.id,))
+
+    expected_path = ExportService._manual_cleanup_path(tmp_path, page, block)
+    assert expected_path.parent.name == f"page-source-{page.id}"
+    assert expected_path.name == f"block-001-{block.id}.png"
+    assert paths == (expected_path,)
+    with Image.open(expected_path) as cleanup:
+        assert cleanup.size == (36, 26)
+        assert cleanup.tobytes() == source.crop((0, 0, 36, 26)).tobytes()
+
+    Image.new("RGB", (36, 26), "red").save(expected_path)
+    ExportService.prepare_manual_cleanups(page, tmp_path, (block.id,))
+    with Image.open(expected_path) as cleanup:
+        assert cleanup.getpixel((0, 0)) == (255, 0, 0)
 
 
 @pytest.mark.parametrize("invalid_kind", ["unreadable", "wrong-size"])
@@ -640,6 +1383,33 @@ def test_flat_preview_falls_back_to_solid_ring_median_without_inpainting(
         assert glyph_pixels
         assert all(preview.getpixel(point) != (20, 30, 40) for point in glyph_pixels)
         assert preview.crop((0, 0, 30, 120)).tobytes() == original.crop((0, 0, 30, 120)).tobytes()
+
+
+def test_preview_cleanup_never_imports_cv2(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "no-cv2.png"
+    save_image(source, "white")
+    page = make_page(
+        source,
+        22,
+        [{"bbox": BoundingBox(x=30, y=20, width=100, height=80), "translated_text": "ไ"}],
+    )
+    imported: list[str] = []
+    original_import = builtins.__import__
+
+    def track_import(name, *args, **kwargs):
+        imported.append(name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", track_import)
+    ExportService.render_page_preview(
+        page,
+        tmp_path,
+        tmp_path / "no-cv2-preview.png",
+        _font_path(),
+        clean_background=True,
+    )
+
+    assert "cv2" not in imported
 
 
 def test_overlapping_cleanup_does_not_erase_earlier_translation(tmp_path: Path) -> None:
@@ -803,7 +1573,7 @@ def test_invalid_page_continues_and_progress_is_monotonic(tmp_path: Path) -> Non
     assert all(item.total == 2 for item in progress)
     assert result.issues[0].page_id == first.id
     assert len(result.preview_paths) == 1
-    assert str(second.id) in result.preview_paths[0].name
+    assert result.preview_paths[0].name == "2.png"
 
 
 @pytest.mark.parametrize(
@@ -846,7 +1616,7 @@ def test_destination_collision_is_rejected_before_any_write(tmp_path: Path) -> N
     output = tmp_path / "out"
     output.mkdir()
     page_id = UUID(int=8)
-    source = output / f"preview-page-0001-{page_id}.png"
+    source = output / "1.png"
     original = save_image(source)
     page = Page(id=page_id, source_path=str(source), width=160, height=120)
 
@@ -912,7 +1682,8 @@ def test_cancellation_between_pages_keeps_completed_files_valid(tmp_path: Path) 
     assert json.loads((output / "project-export.json").read_text(encoding="utf-8"))["name"] == (
         "cancel"
     )
-    assert len(list(output.glob("preview-*.png"))) == 1
+    assert (output / "1.png").is_file()
+    assert not (output / "2.png").exists()
     assert not list(output.glob(".*.tmp"))
     assert first_path.read_bytes() == first_bytes
     assert second_path.read_bytes() == second_bytes

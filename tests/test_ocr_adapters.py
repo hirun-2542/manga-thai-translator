@@ -1,5 +1,8 @@
 import asyncio
+import json
+import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -7,7 +10,7 @@ from PIL import Image
 
 from app.core.models import BoundingBox, SourceLanguage
 from app.services.errors import ProviderError, UnsupportedLanguageError
-from app.services.ocr import MangaOcrProvider, PaddleOcrProvider
+from app.services.ocr import MangaOcrProvider, PaddleOcrProvider, paddle_worker
 from app.services.ocr.paddle_ocr import _as_array
 from app.services.types import ImageInput
 
@@ -350,3 +353,170 @@ def test_paddle_array_conversion_normalizes_rgba_to_rgb(monkeypatch) -> None:
 
     assert _as_array(Image.new("RGBA", (2, 2))) == "array"
     assert seen["mode"] == "RGB"
+
+
+def test_default_paddle_ocr_uses_one_json_child_and_close_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict] = []
+    processes = []
+
+    class Stdin:
+        def __init__(self, process) -> None:
+            self.process = process
+
+        def write(self, line: str) -> None:
+            request = json.loads(line)
+            requests.append(request)
+            self.process.responses.append(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "result": {"rec_texts": ["child result"], "rec_scores": [0.9]},
+                    }
+                )
+                + "\n"
+            )
+
+        def flush(self) -> None:
+            return None
+
+    class Stdout:
+        def __init__(self, process) -> None:
+            self.process = process
+
+        def readline(self) -> str:
+            return self.process.responses.pop(0)
+
+    class Process:
+        def __init__(self) -> None:
+            self.responses: list[str] = []
+            self.stdin = Stdin(self)
+            self.stdout = Stdout(self)
+            self.returncode = None
+            self.terminate_calls = 0
+            self.wait_calls = 0
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.terminate_calls += 1
+            self.returncode = 0
+
+        def wait(self, timeout=None) -> int:
+            self.wait_calls += 1
+            return 0
+
+    def popen(*args, **kwargs):
+        process = Process()
+        processes.append((args, kwargs, process))
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    image = _image(tmp_path / "child.png")
+    provider = PaddleOcrProvider()
+
+    first = asyncio.run(
+        provider.recognize(
+            image,
+            BoundingBox(x=1, y=2, width=3, height=4),
+            SourceLanguage.EN,
+        )
+    )
+    second = asyncio.run(
+        provider.recognize(
+            image,
+            BoundingBox(x=2, y=3, width=4, height=5),
+            SourceLanguage.EN,
+        )
+    )
+    provider.close()
+    provider.close()
+
+    assert first.source_text == second.source_text == "child result"
+    assert len(processes) == 1
+    assert all(json.dumps(request) for request in requests)
+    assert requests[0]["operation"] == "recognize"
+    assert requests[0]["image_path"] == str(image.path)
+    assert requests[0]["bbox"] == {"x": 1.0, "y": 2.0, "width": 3.0, "height": 4.0}
+    assert processes[0][2].terminate_calls == 1
+    assert processes[0][2].wait_calls == 1
+    assert "paddleocr" not in sys.modules
+    assert "cv2" not in sys.modules
+
+
+def test_default_paddle_ocr_child_eof_is_recoverable(tmp_path: Path, monkeypatch) -> None:
+    class Stdout:
+        def readline(self) -> str:
+            return ""
+
+    class Process:
+        class Stdin:
+            def write(self, line: str) -> None:
+                return None
+
+            def flush(self) -> None:
+                return None
+
+        stdin = Stdin()
+        stdout = Stdout()
+        returncode = 1
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            return None
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: Process())
+    provider = PaddleOcrProvider()
+
+    with pytest.raises(ProviderError, match="child") as error:
+        asyncio.run(
+            provider.recognize(
+                _image(tmp_path / "eof.png"),
+                BoundingBox(x=0, y=0, width=2, height=2),
+                SourceLanguage.EN,
+            )
+        )
+
+    assert error.value.recoverable is True
+
+
+def test_paddle_child_redirects_native_stdout_to_stderr(monkeypatch, capsys) -> None:
+    class Model:
+        def predict(self, image):
+            print("native inference log")
+            return [{"rec_texts": ["child"], "rec_scores": [0.8]}]
+
+    class PaddleOCR:
+        def __init__(self, **kwargs) -> None:
+            print("native startup log")
+
+        def predict(self, image):
+            return Model().predict(image)
+
+    monkeypatch.setitem(sys.modules, "paddleocr", types.SimpleNamespace(PaddleOCR=PaddleOCR))
+    monkeypatch.setattr(paddle_worker, "_image_input", lambda *_args: object())
+
+    result = paddle_worker._handle(
+        {
+            "operation": "recognize",
+            "image_path": "page.png",
+            "bbox": {"x": 0, "y": 0, "width": 2, "height": 2},
+            "language": "en",
+            "device": "cpu",
+        },
+        {},
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "native startup log" in captured.err
+    assert "native inference log" in captured.err
+    assert result == [{"rec_texts": ["child"], "rec_scores": [0.8]}]

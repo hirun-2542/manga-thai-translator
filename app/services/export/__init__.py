@@ -6,6 +6,7 @@ from app.services.export.service import (
     ExportResult,
     ExportService,
     OverflowWarning,
+    RenderMetric,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "ExportResult",
     "ExportService",
     "OverflowWarning",
+    "RenderMetric",
 ]

@@ -12,6 +12,7 @@ from app.ui.provider_dialog import (
 def test_provider_defaults_are_explicit_without_an_agent_model(qapp) -> None:
     dialog = TranslationProviderDialog()
 
+    assert dialog.instructions_edit.tabChangesFocus()
     assert [
         dialog.provider_combo.itemData(index) for index in range(dialog.provider_combo.count())
     ] == ["openai-compatible", "ollama", "codex-cli"]
@@ -80,7 +81,7 @@ def test_invalid_base_url_keeps_dialog_open(qapp, base_url: str) -> None:
 
     assert dialog.isVisible()
     assert dialog.result() == QDialog.DialogCode.Rejected
-    assert "absolute HTTP or HTTPS URL with a host" in dialog.error_label.text()
+    assert "Base URL" in dialog.error_label.text()
     assert dialog.error_label.isVisible()
 
 
@@ -118,8 +119,8 @@ def test_codex_cli_uses_login_without_url_key_or_agent_model(qapp) -> None:
     assert dialog.model_edit.text() == "default"
     assert not dialog.upload_images_checkbox.isHidden()
     assert not dialog.upload_images_checkbox.isChecked()
-    assert "logged-in codex cli" in dialog.privacy_label.text().lower()
-    assert "images are not sent" in dialog.privacy_label.text().lower()
+    assert "codex cli" in dialog.privacy_label.text().lower()
+    assert "Images will not be sent." in dialog.privacy_label.text()
 
     dialog.accept()
     configuration = dialog.configuration()
@@ -179,11 +180,10 @@ def test_privacy_notice_and_secret_reference_only(qapp) -> None:
     dialog = TranslationProviderDialog()
     notice = dialog.privacy_label.text().lower()
 
-    assert "ocr text" in notice
-    assert "block ids" in notice
+    assert "ocr" in notice
+    assert "block id" in notice
     assert "project context" in notice
     assert "glossary" in notice
     assert "instructions" in notice
-    assert "images are not sent" in notice
     assert "environment variable" in dialog.api_key_env_edit.toolTip().lower()
     assert not hasattr(dialog, "api_key_edit")

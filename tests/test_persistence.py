@@ -64,6 +64,23 @@ def test_save_load_round_trip_unicode_and_language_overrides(tmp_path: Path) -> 
     source.write_bytes(b"source-image")
     project_dir = tmp_path / "โปรเจกต์มังงะ"
     project = multilingual_project(source)
+    project.pages[0].blocks[0] = (
+        project.pages[0]
+        .blocks[0]
+        .model_copy(
+            update={
+                "typesetting_font_family": "Noto Sans Thai",
+                "typesetting_font_style": "Bold",
+                "typesetting_fill_color": "#102030",
+                "typesetting_stroke_color": "#A0B0C0",
+                "typesetting_stroke_width": 2,
+                "typesetting_font_size": 42,
+                "rotation_degrees": -12.5,
+                "mirror_horizontal": True,
+                "mirror_vertical": True,
+            }
+        )
+    )
     repository = ProjectRepository()
 
     saved_path = repository.save(project, project_dir)
@@ -74,6 +91,15 @@ def test_save_load_round_trip_unicode_and_language_overrides(tmp_path: Path) -> 
     assert source.read_bytes() == b"source-image"
     assert loaded.pages[0].source_language is SourceLanguage.KO
     assert loaded.pages[0].blocks[-1].source_language is SourceLanguage.ZH_HANT
+    assert loaded.pages[0].blocks[0].typesetting_font_size == 42
+    assert loaded.pages[0].blocks[0].rotation_degrees == -12.5
+    assert loaded.pages[0].blocks[0].mirror_horizontal
+    assert loaded.pages[0].blocks[0].mirror_vertical
+    assert loaded.pages[0].blocks[0].typesetting_font_family == "Noto Sans Thai"
+    assert loaded.pages[0].blocks[0].typesetting_font_style == "Bold"
+    assert loaded.pages[0].blocks[0].typesetting_fill_color == "#102030"
+    assert loaded.pages[0].blocks[0].typesetting_stroke_color == "#A0B0C0"
+    assert loaded.pages[0].blocks[0].typesetting_stroke_width == 2
     serialized = saved_path.read_text(encoding="utf-8")
     assert "歡迎回來" in serialized
     assert "ยินดีต้อนรับกลับ" in serialized
@@ -119,11 +145,38 @@ def test_load_rejects_unknown_schema_version(tmp_path: Path) -> None:
         project_dir,
     )
     data = json.loads(project_file.read_text(encoding="utf-8"))
-    data["schema_version"] = 2
+    data["schema_version"] = 3
     project_file.write_text(json.dumps(data), encoding="utf-8")
 
     with pytest.raises(ValidationError, match="schema_version"):
         repository.load(project_dir)
+
+
+def test_load_migrates_v1_text_rotation_to_canonical_region_rotation(
+    tmp_path: Path,
+) -> None:
+    repository = ProjectRepository()
+    project_dir = tmp_path / "legacy"
+    project_file = repository.save(
+        multilingual_project(tmp_path / "page.png"),
+        project_dir,
+    )
+    data = json.loads(project_file.read_text(encoding="utf-8"))
+    data["schema_version"] = 1
+    block = data["pages"][0]["blocks"][0]
+    block["typesetting_rotation_degrees"] = -37.5
+    block.pop("rotation_degrees")
+    block.pop("mirror_horizontal")
+    block.pop("mirror_vertical")
+    project_file.write_text(json.dumps(data), encoding="utf-8")
+
+    loaded = repository.load(project_dir)
+
+    migrated = loaded.pages[0].blocks[0]
+    assert loaded.schema_version == 2
+    assert migrated.rotation_degrees == -37.5
+    assert migrated.mirror_horizontal is False
+    assert migrated.mirror_vertical is False
 
 
 def test_failed_atomic_replace_preserves_previous_project(

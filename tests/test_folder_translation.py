@@ -6,6 +6,7 @@ from PIL import Image, ImageFont
 
 from app.core.models import BlockStatus, BoundingBox, Page, Project, TextBlock
 from app.persistence.project_repository import ProjectRepository
+from app.services.export import ExportService
 from app.services.folder_translation import FolderTranslationService
 from app.services.workflow import CancellationToken, ProgressUpdate, WorkflowCancelled
 
@@ -41,6 +42,35 @@ class FakeImageProvider:
         if path.name in self.failing_names:
             raise RuntimeError(f"failed {path.name}")
         return [_translated_block(page, f"แปล {path.stem}")]
+
+
+def test_folder_translation_normalizes_provider_linebreaks_before_preview_and_save(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _page(tmp_path / "linebreaks.png")
+    project = Project(name="folder linebreaks", pages=[page])
+    provider = FakeImageProvider()
+    preview_texts: list[str] = []
+
+    async def translate_page_image(page, image_path, context):
+        provider.calls.append((page, Path(image_path), context))
+        return [_translated_block(page, "บรรทัดหนึ่ง\nบรรทัดสอง\r\nบรรทัดสาม")]
+
+    provider.translate_page_image = translate_page_image
+
+    def capture_preview(page, *args, **kwargs):
+        preview_texts.append(page.blocks[0].translated_text)
+        return [], []
+
+    monkeypatch.setattr(ExportService, "render_page_preview", capture_preview)
+
+    result = asyncio.run(FolderTranslationService(provider, _font_path()).run(project, tmp_path))
+
+    expected = "บรรทัดหนึ่ง บรรทัดสอง บรรทัดสาม"
+    assert preview_texts == [expected]
+    assert result.project.pages[0].blocks[0].translated_text == expected
+    assert ProjectRepository.load(tmp_path).pages[0].blocks[0].translated_text == expected
 
 
 def test_folder_translation_retranslates_existing_blocks_and_preserves_matching_identity(

@@ -3,6 +3,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from PIL import Image
 from pydantic import ValidationError
 
 from app.core.models import (
@@ -124,6 +125,43 @@ def test_mixed_languages_preserve_block_ids_and_order(tmp_path: Path) -> None:
         "translated-en",
         "translated-zh-Hant",
     ]
+
+
+@pytest.mark.parametrize(
+    ("provider_text", "expected_text"),
+    [
+        ("บรรทัดหนึ่ง\nบรรทัดสอง\r\nบรรทัดสาม", "บรรทัดหนึ่ง บรรทัดสอง บรรทัดสาม"),
+        ("ไม่มีบรรทัดใหม่", "ไม่มีบรรทัดใหม่"),
+        ("", ""),
+    ],
+)
+def test_workflow_normalizes_provider_translation_linebreaks(
+    tmp_path: Path,
+    provider_text: str,
+    expected_text: str,
+) -> None:
+    image = tmp_path / "linebreaks.png"
+    image.touch()
+    page = _page(image, language=SourceLanguage.EN)
+    block = _block(page, 0)
+    block.source_text = "source\nline"
+    block.status = BlockStatus.OCR_REVIEWED
+    page.blocks = [block]
+
+    class LineBreakingTranslation:
+        async def translate_blocks(self, blocks, context):
+            return [TranslationResult(id=blocks[0].id, translated_text=provider_text)]
+
+    result = _run(
+        Project(name="translation linebreaks", pages=[page]),
+        tmp_path,
+        translation=LineBreakingTranslation(),
+        mode="translate",
+    )
+
+    translated = result.project.pages[0].blocks[0]
+    assert translated.translated_text == expected_text
+    assert translated.source_text == "source\nline"
 
 
 def test_manual_blocks_skip_detection_and_are_preserved(tmp_path: Path) -> None:
@@ -516,6 +554,58 @@ def test_ocr_mode_runs_only_selected_block_without_translation(tmp_path: Path) -
         ("detection", 1, 1),
         ("ocr", 1, 1),
     ]
+
+
+def test_rotated_region_is_unwrapped_before_ocr_and_temp_crop_is_removed(
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "rotated.png"
+    source = Image.new("RGB", (100, 200), "white")
+    local_region = Image.new("RGB", (40, 20), "red")
+    local_region.paste("blue", (20, 0, 40, 20))
+    source.paste(
+        local_region.rotate(-90, resample=Image.Resampling.NEAREST, expand=True),
+        (30, 20),
+    )
+    source.save(image_path)
+    page = _page(image_path, language=SourceLanguage.EN)
+    block = TextBlock(
+        page_id=page.id,
+        bbox=BoundingBox(x=20, y=30, width=40, height=20),
+        reading_order=1,
+        rotation_degrees=90,
+    )
+    page.blocks = [block]
+    calls = []
+
+    class CapturingOcr:
+        async def recognize(self, image, bbox, source_language):
+            calls.append((image, bbox, source_language, image.path.exists()))
+            with Image.open(image.path) as crop:
+                assert crop.size == (40, 20)
+                assert crop.getpixel((5, 10))[0] > crop.getpixel((5, 10))[2]
+                assert crop.getpixel((35, 10))[2] > crop.getpixel((35, 10))[0]
+            return OcrResult(
+                source_text="rotated",
+                confidence=1,
+                provider="capturing",
+                detected_language=SourceLanguage.EN,
+            )
+
+    result = _run(
+        Project(name="rotated", pages=[page]),
+        tmp_path,
+        ocr=CapturingOcr(),
+        mode="ocr",
+    )
+
+    ocr_image, bbox, language, existed_during_call = calls[0]
+    assert ocr_image.path != image_path
+    assert bbox == BoundingBox(x=0, y=0, width=40, height=20)
+    assert language is SourceLanguage.EN
+    assert existed_during_call
+    assert not ocr_image.path.exists()
+    assert result.project.pages[0].blocks[0].source_text == "rotated"
 
 
 def test_ocr_mode_detects_only_selected_blank_page(tmp_path: Path) -> None:

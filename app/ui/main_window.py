@@ -5,23 +5,36 @@ from pathlib import Path
 from uuid import UUID
 
 from PIL import ImageFont
-from PySide6.QtCore import QSignalBlocker, Qt, QThread
-from PySide6.QtGui import QAction, QCloseEvent, QKeySequence, QShortcut
+from PySide6.QtCore import QSettings, QSignalBlocker, Qt, QThread, QUrl
+from PySide6.QtGui import (
+    QAction,
+    QActionGroup,
+    QCloseEvent,
+    QDesktopServices,
+    QKeySequence,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QComboBox,
     QDialog,
     QDockWidget,
     QFileDialog,
+    QHBoxLayout,
     QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPlainTextEdit,
     QProgressBar,
+    QScrollBar,
     QSplitter,
+    QTabWidget,
     QTextEdit,
     QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -40,8 +53,18 @@ from app.core.models import (
 from app.core.reading_order import normalize_reading_order
 from app.persistence.project_repository import ProjectRepository
 from app.persistence.secrets import resolve_api_key
-from app.services.export import ExportIssue, ExportProgress, ExportResult
+from app.services.export import (
+    ExportIssue,
+    ExportProgress,
+    ExportResult,
+    ExportService,
+    RenderMetric,
+)
 from app.services.folder_translation import FolderTranslationService
+from app.services.iopaint_cleanup import (
+    IOPaintCleanupService,
+    IOPaintConfiguration,
+)
 from app.services.ocr import (
     MangaOcrProvider,
     MockOcrProvider,
@@ -66,44 +89,142 @@ from app.services.workflow import (
     WorkflowService,
 )
 from app.ui.block_editor import BlockEditor
+from app.ui.block_strip import BlockStrip
 from app.ui.image_viewer import ImageViewer
+from app.ui.iopaint_dialog import IOPaintSettingsDialog
 from app.ui.page_sidebar import PageSidebar
 from app.ui.provider_dialog import TranslationProviderDialog
 from app.ui.workers import (
+    CleanupProgress,
     ExportWorker,
     FolderTranslationWorker,
+    ImageCleanupWorker,
+    PageCleanupResult,
+    PageImageCleanupWorker,
     PreviewWorker,
     WorkflowWorker,
 )
 
 _CLOSE_WAIT_MS = 2_000
 _WORKFLOW_UNDO_LIMIT = 20
+_PREVIEW_FIELDS = (
+    "bbox",
+    "reading_order",
+    "writing_mode",
+    "source_text",
+    "translated_text",
+    "typesetting_font_family",
+    "typesetting_font_style",
+    "typesetting_fill_color",
+    "typesetting_stroke_color",
+    "typesetting_stroke_width",
+    "typesetting_font_size",
+    "typesetting_line_spacing",
+    "typesetting_alignment",
+    "rotation_degrees",
+    "mirror_horizontal",
+    "mirror_vertical",
+)
+
+_WORKFLOW_LABELS = {
+    "Workflow": "Workflow",
+    "OCR selected block": "OCR Selected Blocks",
+    "OCR current page": "OCR Current Page",
+    "OCR all pages": "OCR All Pages",
+    "Translate selected block": "Translate Selected Blocks",
+    "Translate current page": "Translate Current Page",
+    "Translate all pages": "Translate All Pages",
+    "Translate folder images": "Translate Folder Images",
+    "Export": "Export",
+    "Thai preview": "Thai Preview",
+    "Re-clean selected block": "Re-clean Selected Blocks",
+    "Re-clean current page": "Re-clean Current Page",
+    "IOPaint clean selected block": "IOPaint Clean Selected Blocks",
+    "IOPaint clean current page": "IOPaint Clean Current Page",
+}
+_STAGE_LABELS = {
+    "detection": "Detection",
+    "ocr": "OCR",
+    "translation": "Translation",
+}
+
+
+def _count_label(count: int, singular: str) -> str:
+    return f"{count} {singular if count == 1 else singular + 's'}"
 
 
 class MainWindow(QMainWindow):
     """Coordinate the persisted project model without owning domain workflows."""
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, *, settings: QSettings | None = None) -> None:
         super().__init__(parent)
+        self._settings = settings or QSettings(
+            QSettings.Format.IniFormat,
+            QSettings.Scope.UserScope,
+            "Manga Thai Translator",
+            "Manga Thai Translator",
+        )
         self._project: Project | None = None
         self._project_dir: Path | None = None
         self._current_page_id: UUID | None = None
         self._current_block_id: UUID | None = None
         self._workflow_thread: QThread | None = None
         self._workflow_worker: (
-            WorkflowWorker | FolderTranslationWorker | ExportWorker | PreviewWorker | None
+            WorkflowWorker
+            | FolderTranslationWorker
+            | ExportWorker
+            | PreviewWorker
+            | ImageCleanupWorker
+            | PageImageCleanupWorker
+            | None
         ) = None
         self._workflow_name = "Workflow"
         self._refresh_preview_after_translation = False
         self._translation_configuration: ProviderConfiguration | None = None
         self._thai_font_path: Path | None = None
+        self._iopaint_configuration = IOPaintConfiguration()
+        self._render_metrics: dict[UUID, RenderMetric] = {}
         self._workflow_undo_history: list[tuple[Project, UUID | None, UUID | None]] = []
-
+        self._syncing_viewers = False
+        self._comparison_split_sizes = [1, 1]
         self.page_sidebar = PageSidebar()
+        self.block_strip = BlockStrip()
+        self.navigator_tabs = QTabWidget()
+        self.navigator_tabs.setAccessibleName("Page and block navigator")
+        self.navigator_tabs.tabBar().setAccessibleName("Page and block navigator tabs")
+        self.navigator_tabs.addTab(self.page_sidebar, "Pages")
+        self.navigator_tabs.addTab(self.block_strip, "Blocks")
         self.image_viewer = ImageViewer()
+        self.image_viewer.setAccessibleName("Original image")
         self.preview_viewer = ImageViewer()
+        self.preview_viewer.setAccessibleName("Thai Preview")
         self.block_editor = BlockEditor()
-        comparison = QSplitter()
+        comparison = QWidget()
+        comparison_layout = QVBoxLayout(comparison)
+        comparison_layout.setContentsMargins(0, 0, 0, 0)
+        comparison_layout.setSpacing(4)
+        viewer_controls = QHBoxLayout()
+        viewer_controls.setContentsMargins(4, 4, 4, 0)
+        viewer_controls.addStretch()
+        self.view_mode_group = QButtonGroup(self)
+        self.view_mode_group.setExclusive(True)
+        self.view_mode_buttons: dict[str, QToolButton] = {}
+        for mode, label in (
+            ("split", "Split"),
+            ("original", "Original"),
+            ("preview", "Thai Preview"),
+        ):
+            button = QToolButton()
+            button.setText(label)
+            button.setCheckable(True)
+            button.setMinimumHeight(36)
+            button.setAccessibleName(f"View mode: {label}")
+            button.clicked.connect(lambda _checked=False, mode=mode: self.set_view_mode(mode))
+            self.view_mode_group.addButton(button)
+            self.view_mode_buttons[mode] = button
+            viewer_controls.addWidget(button)
+        comparison_layout.addLayout(viewer_controls)
+        viewers = QSplitter()
         for label, viewer in (
             ("Original", self.image_viewer),
             ("Thai Preview", self.preview_viewer),
@@ -112,23 +233,37 @@ class MainWindow(QMainWindow):
             layout = QVBoxLayout(pane)
             layout.addWidget(QLabel(label))
             layout.addWidget(viewer)
-            comparison.addWidget(pane)
+            viewers.addWidget(pane)
+            if viewer is self.image_viewer:
+                self.original_pane = pane
+            else:
+                self.preview_pane = pane
+        comparison_layout.addWidget(viewers)
+        self.zoom_label = QLabel("100%")
+        self.zoom_label.setAccessibleName("Zoom level")
+        viewer_controls.insertWidget(0, self.zoom_label)
         splitter = QSplitter()
-        splitter.addWidget(self.page_sidebar)
+        splitter.addWidget(self.navigator_tabs)
         splitter.addWidget(comparison)
         splitter.addWidget(self.block_editor)
         splitter.setStretchFactor(1, 1)
+        splitter.setSizes([240, 760, 360])
         self.setCentralWidget(splitter)
         self.splitter = splitter
         self.comparison_pane = comparison
+        self.comparison_splitter = viewers
+        self.comparison_splitter.setSizes(self._comparison_split_sizes)
+        self.view_mode_buttons["split"].setChecked(True)
         self._create_progress_dock()
         self._create_language_toolbar()
-        self.statusBar().showMessage("Open an existing project to begin.")
+        self.statusBar().showMessage("Open or create a project to begin.")
 
         self._create_actions()
         self._connect_widgets()
+        self._restore_ui_state()
+        self._set_focus_order()
         self.setWindowTitle("Manga Thai Translator")
-        self.resize(1200, 760)
+        self.resize(1366, 768)
 
     @property
     def project(self) -> Project | None:
@@ -141,6 +276,21 @@ class MainWindow(QMainWindow):
     @property
     def translation_configuration(self) -> ProviderConfiguration | None:
         return self._translation_configuration
+
+    @property
+    def iopaint_configuration(self) -> IOPaintConfiguration:
+        return self._iopaint_configuration
+
+    def set_iopaint_configuration(self, configuration: IOPaintConfiguration) -> None:
+        if configuration == self._iopaint_configuration:
+            return
+        self._iopaint_configuration = configuration
+        self._append_log(
+            "IOPaint configured: "
+            f"{configuration.executable} / {configuration.model} / "
+            f"{configuration.device} / timeout "
+            f"{configuration.operation_timeout_seconds:g}s"
+        )
 
     def set_translation_configuration(self, configuration: ProviderConfiguration | None) -> None:
         self._translation_configuration = configuration
@@ -161,6 +311,7 @@ class MainWindow(QMainWindow):
             or self._project_dir != directory
         ):
             self._workflow_undo_history.clear()
+            self._render_metrics.clear()
         self._project = project
         self._project_dir = directory
         self._current_page_id = None
@@ -168,6 +319,7 @@ class MainWindow(QMainWindow):
         self.block_editor.set_block(None)
         self.image_viewer.set_page(None)
         self.preview_viewer.set_page(None)
+        self.block_strip.set_page(None)
         self.page_sidebar.set_pages(project.pages if project is not None else [])
         self._sync_language_controls()
 
@@ -327,10 +479,10 @@ class MainWindow(QMainWindow):
 
     def ocr_selected_block(self) -> bool:
         page = self._current_page()
-        block = self._current_block()
-        if page is None or block is None:
+        block_ids = self.image_viewer.selected_block_ids
+        if page is None or not block_ids:
             return False
-        return self._start_ocr((page.id,), (block.id,), "OCR selected block")
+        return self._start_ocr((page.id,), block_ids, "OCR selected block")
 
     def ocr_current_page(self) -> bool:
         page = self._current_page()
@@ -345,38 +497,52 @@ class MainWindow(QMainWindow):
 
     def confirm_ocr_current_page(self) -> bool:
         page = self._current_page()
-        if page is None or self.is_busy:
+        if page is None:
             return False
-        eligible = {block.id for block in page.blocks if block.status is BlockStatus.OCR_COMPLETE}
-        if not eligible:
+        return self._confirm_ocr_pages((page,), "on the current page")
+
+    def confirm_ocr_all_pages(self) -> bool:
+        if self._project is None:
+            return False
+        return self._confirm_ocr_pages(self._project.pages, "on all pages")
+
+    def _confirm_ocr_pages(self, pages: Iterable[Page], scope: str) -> bool:
+        if self.is_busy:
+            return False
+        pages = tuple(pages)
+        eligible_count = sum(
+            block.status is BlockStatus.OCR_COMPLETE for page in pages for block in page.blocks
+        )
+        if not eligible_count:
             return False
         updated_at = utc_now()
-        page.blocks = [
-            (
-                block.model_copy(
-                    update={"status": BlockStatus.OCR_REVIEWED, "updated_at": updated_at}
+        for page in pages:
+            page.blocks = [
+                (
+                    block.model_copy(
+                        update={"status": BlockStatus.OCR_REVIEWED, "updated_at": updated_at}
+                    )
+                    if block.status is BlockStatus.OCR_COMPLETE
+                    else block
                 )
-                if block.id in eligible
-                else block
-            )
-            for block in page.blocks
-        ]
+                for block in page.blocks
+            ]
         selected = self._current_block()
         if selected is not None:
             self.image_viewer.update_block(selected)
             self.block_editor.set_block(selected)
         self._update_action_states()
-        message = f"Confirmed OCR for {len(eligible)} block(s) on current page."
+        message = f"Confirmed OCR for {_count_label(eligible_count, 'block')} {scope}."
         self.statusBar().showMessage(message)
         self._append_log(message)
         return True
 
     def translate_selected_block(self) -> bool:
         page = self._current_page()
-        block = self._current_block()
-        if page is None or block is None:
+        block_ids = self.image_viewer.selected_block_ids
+        if page is None or not block_ids:
             return False
-        return self._start_translation((page.id,), (block.id,), "Translate selected block")
+        return self._start_translation((page.id,), block_ids, "Translate selected block")
 
     def translate_current_page(self) -> bool:
         page = self._current_page()
@@ -422,6 +588,11 @@ class MainWindow(QMainWindow):
         output_dir: Path | str,
         font_path: Path | str,
         background_color: str = "white",
+        *,
+        watermark_text: str | None = None,
+        watermark_logo_path: Path | str | None = None,
+        banner_path: Path | str | None = None,
+        banner_position: str = "end",
     ) -> bool:
         if self._project is None or self._project_dir is None:
             self._report_error("Could not start export: open a saved project first")
@@ -435,6 +606,10 @@ class MainWindow(QMainWindow):
             font_path,
             background_color,
             clean_background=True,
+            watermark_text=watermark_text,
+            watermark_logo_path=watermark_logo_path,
+            banner_path=banner_path,
+            banner_position=banner_position,
         )
         return self._start_background_worker(
             worker,
@@ -449,11 +624,145 @@ class MainWindow(QMainWindow):
             return False
         if not self._ensure_thai_font():
             return False
-        destination = self._project_dir / "previews" / f"preview-page-{page.id}.png"
-        worker = PreviewWorker(page, self._project_dir, destination, self._thai_font_path)
+        return self._start_page_preview(page, "Thai preview")
+
+    def reclean_selected_block(self) -> bool:
+        page = self._current_page()
+        block_ids = self.image_viewer.selected_block_ids
+        if page is None or not block_ids:
+            return False
+        return self._reclean_page(page, block_ids, "Re-clean selected block")
+
+    def reclean_current_page(self) -> bool:
+        page = self._current_page()
+        if page is None:
+            return False
+        return self._reclean_page(
+            page,
+            (block.id for block in page.blocks),
+            "Re-clean current page",
+        )
+
+    def iopaint_clean_selected_block(self) -> bool:
+        page = self._current_page()
+        block_ids = self.image_viewer.selected_block_ids
+        if page is None or not block_ids or self._project_dir is None or self.is_busy:
+            return False
+        service = IOPaintCleanupService(self._iopaint_configuration)
+        if len(block_ids) == 1:
+            worker = ImageCleanupWorker(service, page, self._project_dir, block_ids[0])
+        else:
+            worker = PageImageCleanupWorker(service, page, self._project_dir, block_ids)
         return self._start_background_worker(
             worker,
-            "Thai preview",
+            "IOPaint clean selected block",
+            self._cleanup_progress if len(block_ids) > 1 else (lambda _update: None),
+            self._iopaint_page_cleanup_completed
+            if len(block_ids) > 1
+            else self._iopaint_cleanup_completed,
+        )
+
+    def iopaint_clean_current_page(self) -> bool:
+        page = self._current_page()
+        if page is None or self._project_dir is None or self.is_busy:
+            return False
+        block_ids = tuple(block.id for block in page.blocks)
+        if not block_ids:
+            self._report_error("Could not clean the current page with IOPaint: no text blocks")
+            return False
+        service = IOPaintCleanupService(self._iopaint_configuration)
+        return self._start_background_worker(
+            PageImageCleanupWorker(service, page, self._project_dir, block_ids),
+            "IOPaint clean current page",
+            self._cleanup_progress,
+            self._iopaint_page_cleanup_completed,
+        )
+
+    def prepare_manual_cleanup_selected_block(self) -> bool:
+        page = self._current_page()
+        block = self._current_block()
+        if page is None or block is None:
+            return False
+        return self._prepare_manual_cleanups(page, (block.id,), open_folder=False)
+
+    def prepare_manual_cleanups_current_page(self) -> bool:
+        page = self._current_page()
+        if page is None:
+            return False
+        block_ids = tuple(block.id for block in page.blocks if block.translated_text)
+        if not block_ids:
+            self._report_error("Could not prepare cleanup files: no translated blocks")
+            return False
+        return self._prepare_manual_cleanups(page, block_ids, open_folder=True)
+
+    def _prepare_manual_cleanups(
+        self,
+        page: Page,
+        block_ids: Iterable[UUID],
+        *,
+        open_folder: bool,
+    ) -> bool:
+        if self._project_dir is None or self.is_busy:
+            return False
+        try:
+            paths = ExportService.prepare_manual_cleanups(
+                page,
+                self._project_dir,
+                block_ids,
+            )
+        except (OSError, ValueError) as error:
+            self._report_error(f"Could not prepare cleanup files: {error}")
+            return False
+        if not paths:
+            return False
+        for path in paths:
+            self._append_log(f"Manual cleanup file ready: {path}")
+        target = paths[0].parent if open_folder else paths[0]
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(target))):
+            self._report_error(f"Could not open manual cleanup file: {target}")
+            return False
+        message = (
+            "Manual cleanup file ready. Remove only the source text without changing the image size, "
+            "save the PNG, then use Refresh Thai Preview."
+        )
+        self.statusBar().showMessage(message)
+        self._append_log(message)
+        return True
+
+    def _reclean_page(self, page: Page, block_ids: Iterable[UUID], name: str) -> bool:
+        if self._project_dir is None or self.is_busy or not self._ensure_thai_font():
+            return False
+        try:
+            archived = ExportService.archive_manual_cleanups(
+                self._project_dir,
+                page.id,
+                block_ids,
+            )
+        except OSError as error:
+            self._report_error(f"{_WORKFLOW_LABELS.get(name, name)} failed: {error}")
+            return False
+        for path in archived:
+            self._append_log(f"Archived existing cleanup file: {path}")
+        if not archived:
+            self._append_log(
+                f"{_WORKFLOW_LABELS.get(name, name)}: no existing cleanup file; rendering the page again"
+            )
+        return self._start_page_preview(page, name)
+
+    def _start_page_preview(self, page: Page, name: str) -> bool:
+        destination = self._project_dir / "previews" / f"preview-page-{page.id}.png"
+        self.block_editor.set_thai_font_label(
+            self._thai_font_path.name if self._thai_font_path is not None else None
+        )
+        for block in page.blocks:
+            self._render_metrics.pop(block.id, None)
+        if self._current_page_id == page.id:
+            self.block_editor.set_render_metric(None)
+        worker = PreviewWorker(page, self._project_dir, destination, self._thai_font_path)
+        worker.metric.connect(self._preview_metric_received)
+        return self._start_background_worker(
+            worker,
+            name,
             lambda _update: None,
             self._preview_completed,
         )
@@ -556,7 +865,14 @@ class MainWindow(QMainWindow):
 
     def _start_background_worker(
         self,
-        worker: WorkflowWorker | FolderTranslationWorker | ExportWorker | PreviewWorker,
+        worker: (
+            WorkflowWorker
+            | FolderTranslationWorker
+            | ExportWorker
+            | PreviewWorker
+            | ImageCleanupWorker
+            | PageImageCleanupWorker
+        ),
         name: str,
         progress_callback: Callable[[object], None],
         completed_callback: Callable[[object], None],
@@ -576,13 +892,16 @@ class MainWindow(QMainWindow):
         self._workflow_thread = thread
         self._workflow_worker = worker
         self._workflow_name = name
+        display_name = _WORKFLOW_LABELS.get(name, name)
         self._refresh_preview_after_translation = False
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
-        self.progress_label.setText(f"Starting {name}…")
-        self.progress_dock.show()
-        self._append_log(f"{name} started.")
-        self.statusBar().showMessage(f"{name} running…")
+        self.status_progress.setRange(0, 1)
+        self.status_progress.setValue(0)
+        self.status_progress.show()
+        self.progress_label.setText(f"Starting {display_name}…")
+        self._append_log(f"{display_name} started.")
+        self.statusBar().showMessage(f"{display_name} running…")
         self._update_action_states()
         thread.start()
         return True
@@ -590,7 +909,8 @@ class MainWindow(QMainWindow):
     def cancel_workflow(self) -> None:
         if self._workflow_worker is not None:
             self._workflow_worker.cancel()
-            self.statusBar().showMessage(f"Cancelling {self._workflow_name}…")
+            label = _WORKFLOW_LABELS.get(self._workflow_name, self._workflow_name)
+            self.statusBar().showMessage(f"Cancelling {label}…")
 
     def select_previous_page(self) -> None:
         if self.page_sidebar.currentRow() > 0:
@@ -601,21 +921,141 @@ class MainWindow(QMainWindow):
         if 0 <= row < self.page_sidebar.count() - 1:
             self.page_sidebar.setCurrentRow(row + 1)
 
+    def move_page_earlier(self) -> bool:
+        return self._move_current_page(-1)
+
+    def move_page_later(self) -> bool:
+        return self._move_current_page(1)
+
+    def _move_current_page(self, offset: int) -> bool:
+        if self.is_busy or self._project is None:
+            return False
+        page_index = next(
+            (
+                index
+                for index, page in enumerate(self._project.pages)
+                if page.id == self._current_page_id
+            ),
+            None,
+        )
+        if page_index is None:
+            return False
+        target_index = page_index + offset
+        if not 0 <= target_index < len(self._project.pages):
+            return False
+        self._project.pages[page_index], self._project.pages[target_index] = (
+            self._project.pages[target_index],
+            self._project.pages[page_index],
+        )
+        self._refresh_sidebar()
+        self._update_action_states()
+        return True
+
+    def delete_current_page(self) -> bool:
+        if self.is_busy or self._project is None:
+            return False
+        page_index = next(
+            (
+                index
+                for index, page in enumerate(self._project.pages)
+                if page.id == self._current_page_id
+            ),
+            None,
+        )
+        if page_index is None:
+            return False
+        reply = QMessageBox.question(
+            self,
+            "Delete Current Page",
+            "Remove this page from the project?\nThe source image will not be deleted.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return False
+
+        del self._project.pages[page_index]
+        self._current_page_id = None
+        self._current_block_id = None
+        self.block_editor.set_block(None)
+        self.image_viewer.clear_selection()
+        self.image_viewer.set_page(None)
+        self.preview_viewer.set_page(None)
+        self.block_strip.set_page(None)
+        self._refresh_sidebar()
+        if self._project.pages:
+            target_index = min(page_index, len(self._project.pages) - 1)
+            self.page_sidebar.select_page(self._project.pages[target_index].id)
+        else:
+            self._sync_language_controls()
+            self._update_action_states()
+        self.statusBar().showMessage("Removed page from project; source image was not deleted.")
+        return True
+
     def _fit_viewers(self) -> None:
         self.image_viewer.fit_to_window()
-        self.preview_viewer.fit_to_window()
 
     def _reset_viewers(self) -> None:
         self.image_viewer.reset_zoom()
-        self.preview_viewer.reset_zoom()
 
     def _zoom_in_viewers(self) -> None:
         self.image_viewer.zoom_in()
-        self.preview_viewer.zoom_in()
 
     def _zoom_out_viewers(self) -> None:
         self.image_viewer.zoom_out()
-        self.preview_viewer.zoom_out()
+
+    def set_view_mode(self, mode: str) -> None:
+        if mode not in self.view_mode_buttons:
+            raise ValueError(f"Unsupported view mode: {mode}")
+        if not self.original_pane.isHidden() and not self.preview_pane.isHidden():
+            sizes = self.comparison_splitter.sizes()
+            if all(size > 0 for size in sizes):
+                self._comparison_split_sizes = sizes
+
+        self.original_pane.setVisible(mode != "preview")
+        self.preview_pane.setVisible(mode != "original")
+        if mode == "split":
+            self.comparison_splitter.setSizes(self._comparison_split_sizes)
+        self.view_mode_buttons[mode].setChecked(True)
+        if hasattr(self, "split_view_action"):
+            {
+                "split": self.split_view_action,
+                "original": self.original_view_action,
+                "preview": self.preview_view_action,
+            }[mode].setChecked(True)
+
+    def _update_zoom_label(self) -> None:
+        self.zoom_label.setText(f"{self.image_viewer.zoom_percent:.0f}%")
+
+    def _sync_view_transform(self, source: ImageViewer, target: ImageViewer) -> None:
+        if self._syncing_viewers:
+            return
+        self._syncing_viewers = True
+        try:
+            target.setTransform(source.transform())
+            self._set_synced_scrollbar(source.horizontalScrollBar(), target.horizontalScrollBar())
+            self._set_synced_scrollbar(source.verticalScrollBar(), target.verticalScrollBar())
+        finally:
+            self._syncing_viewers = False
+
+    def _sync_scrollbar(self, source: QScrollBar, target: QScrollBar) -> None:
+        if self._syncing_viewers:
+            return
+        self._syncing_viewers = True
+        try:
+            self._set_synced_scrollbar(source, target)
+        finally:
+            self._syncing_viewers = False
+
+    @staticmethod
+    def _set_synced_scrollbar(source: QScrollBar, target: QScrollBar) -> None:
+        source_span = source.maximum() - source.minimum()
+        target_span = target.maximum() - target.minimum()
+        value = target.minimum()
+        if source_span > 0:
+            progress = (source.value() - source.minimum()) / source_span
+            value += round(progress * target_span)
+        target.setValue(value)
 
     def select_previous_block(self) -> None:
         self._select_adjacent_block(-1)
@@ -657,21 +1097,51 @@ class MainWindow(QMainWindow):
         self.configure_translation_action = self._action(
             "Configure Translation Provider…", None, self._configure_translation_provider
         )
+        self.configure_iopaint_action = self._action(
+            "Configure IOPaint…", None, self._configure_iopaint
+        )
         self.choose_thai_font_action = self._action(
             "Choose Thai Font…", None, self._choose_thai_font
         )
         self.refresh_preview_action = self._action(
             "Refresh Thai Preview", None, self.refresh_thai_preview
         )
+        self.reclean_selected_action = self._action(
+            "Re-clean Selected Blocks", None, self.reclean_selected_block
+        )
+        self.reclean_page_action = self._action(
+            "Re-clean Current Page", None, self.reclean_current_page
+        )
+        self.iopaint_clean_selected_action = self._action(
+            "IOPaint Clean Selected Blocks", None, self.iopaint_clean_selected_block
+        )
+        self.iopaint_clean_page_action = self._action(
+            "IOPaint Clean Current Page", None, self.iopaint_clean_current_page
+        )
+        self.prepare_manual_cleanup_action = self._action(
+            "Prepare Manual Cleanup for Selected Block",
+            None,
+            self.prepare_manual_cleanup_selected_block,
+        )
+        self.prepare_page_cleanups_action = self._action(
+            "Prepare Manual Cleanups for Current Page",
+            None,
+            self.prepare_manual_cleanups_current_page,
+        )
         self.show_source_action = self._action("Show Source Image", None, self.show_source_image)
-        self.ocr_selected_action = self._action("OCR Selected Block", None, self.ocr_selected_block)
+        self.ocr_selected_action = self._action(
+            "OCR Selected Blocks", None, self.ocr_selected_block
+        )
         self.ocr_page_action = self._action("OCR Current Page", None, self.ocr_current_page)
         self.ocr_all_action = self._action("OCR All Pages", None, self.ocr_all_pages)
         self.confirm_ocr_page_action = self._action(
             "Confirm OCR for Current Page", None, self.confirm_ocr_current_page
         )
+        self.confirm_ocr_all_action = self._action(
+            "Confirm OCR for All Pages", None, self.confirm_ocr_all_pages
+        )
         self.translate_selected_action = self._action(
-            "Translate Selected Block", None, self.translate_selected_block
+            "Translate Selected Blocks", None, self.translate_selected_block
         )
         self.translate_page_action = self._action(
             "Translate Current Page", None, self.translate_current_page
@@ -696,11 +1166,20 @@ class MainWindow(QMainWindow):
         self.move_block_later_action = self._action(
             "Move Block Later", "Ctrl+Alt+Down", self.move_block_later
         )
+        self.move_page_earlier_action = self._action(
+            "Move Page Earlier", "Ctrl+Alt+Left", self.move_page_earlier
+        )
+        self.move_page_later_action = self._action(
+            "Move Page Later", "Ctrl+Alt+Right", self.move_page_later
+        )
+        self.delete_page_action = self._action(
+            "Delete Current Page", None, self.delete_current_page
+        )
         self.draw_block_action = self._action(
             "Draw Block", "B", self.image_viewer.set_draw_mode, checkable=True
         )
         self.delete_block_action = self._action(
-            "Delete Block", QKeySequence.StandardKey.Delete, self._delete_selected_block
+            "Delete Selected Blocks", QKeySequence.StandardKey.Delete, self._delete_selected_block
         )
         self.fit_action = self._action("Fit to Window", "F", self._fit_viewers)
         self.reset_zoom_action = self._action("Reset Zoom", "1", self._reset_viewers)
@@ -710,8 +1189,14 @@ class MainWindow(QMainWindow):
         self.zoom_out_action = self._action(
             "Zoom Out", QKeySequence.StandardKey.ZoomOut, self._zoom_out_viewers
         )
+        self.view_mode_actions = QActionGroup(self)
+        self.view_mode_actions.setExclusive(True)
+        self.split_view_action = self._view_mode_action("Split", "Alt+0", "split")
+        self.original_view_action = self._view_mode_action("Original", "Alt+1", "original")
+        self.preview_view_action = self._view_mode_action("Thai Preview", "Alt+2", "preview")
+        self.split_view_action.setChecked(True)
 
-        file_menu = self.menuBar().addMenu("&File")
+        file_menu = self.menuBar().addMenu("File")
         file_menu.addActions(
             (
                 self.open_images_action,
@@ -723,7 +1208,7 @@ class MainWindow(QMainWindow):
                 self.export_action,
             )
         )
-        workflow_menu = self.menuBar().addMenu("&Workflow")
+        workflow_menu = self.menuBar().addMenu("Workflow")
         workflow_menu.addActions(
             (
                 self.translate_folder_action,
@@ -733,71 +1218,80 @@ class MainWindow(QMainWindow):
                 self.ocr_page_action,
                 self.ocr_all_action,
                 self.confirm_ocr_page_action,
+                self.confirm_ocr_all_action,
                 self.translate_selected_action,
                 self.translate_page_action,
                 self.translate_all_action,
                 self.cancel_workflow_action,
             )
         )
-        settings_menu = self.menuBar().addMenu("&Settings")
-        settings_menu.addActions((self.configure_translation_action, self.choose_thai_font_action))
-        navigate_menu = self.menuBar().addMenu("&Navigate")
+        settings_menu = self.menuBar().addMenu("Settings")
+        settings_menu.addActions(
+            (
+                self.configure_translation_action,
+                self.configure_iopaint_action,
+                self.choose_thai_font_action,
+            )
+        )
+        navigate_menu = self.menuBar().addMenu("Navigate")
         navigate_menu.addActions(
             (
                 self.previous_page_action,
                 self.next_page_action,
+                self.move_page_earlier_action,
+                self.move_page_later_action,
+                self.delete_page_action,
                 self.previous_block_action,
                 self.next_block_action,
                 self.move_block_earlier_action,
                 self.move_block_later_action,
             )
         )
-        view_menu = self.menuBar().addMenu("&View")
+        view_menu = self.menuBar().addMenu("View")
         view_menu.addActions(
             (
                 self.draw_block_action,
                 self.delete_block_action,
                 self.refresh_preview_action,
+                self.reclean_selected_action,
+                self.reclean_page_action,
+                self.iopaint_clean_selected_action,
+                self.iopaint_clean_page_action,
+                self.prepare_manual_cleanup_action,
+                self.prepare_page_cleanups_action,
                 self.show_source_action,
                 self.fit_action,
                 self.reset_zoom_action,
                 self.zoom_in_action,
                 self.zoom_out_action,
+                self.split_view_action,
+                self.original_view_action,
+                self.preview_view_action,
             )
         )
 
-        toolbar = QToolBar("Main")
+        toolbar = QToolBar("Main toolbar")
         toolbar.setObjectName("main_toolbar")
+        toolbar.setAccessibleName("Main toolbar")
         toolbar.addActions(
             (
                 self.open_images_action,
-                self.open_image_folder_action,
-                self.new_project_action,
-                self.open_action,
-                self.import_images_action,
                 self.save_action,
-                self.export_action,
-                self.run_workflow_action,
                 self.undo_workflow_action,
-                self.translate_folder_action,
-                self.configure_translation_action,
+                self.run_workflow_action,
+                self.export_action,
                 self.cancel_workflow_action,
-                self.previous_page_action,
-                self.next_page_action,
-                self.previous_block_action,
-                self.next_block_action,
-                self.move_block_earlier_action,
-                self.move_block_later_action,
-                self.draw_block_action,
-                self.delete_block_action,
-                self.fit_action,
-                self.reset_zoom_action,
-                self.zoom_in_action,
-                self.zoom_out_action,
             )
         )
+        self.cancel_workflow_action.setVisible(False)
         self.addToolBar(toolbar)
         self.toolbar = toolbar
+        for action in toolbar.actions():
+            button = toolbar.widgetForAction(action)
+            if button is not None:
+                button.setAccessibleName(action.text().replace("…", ""))
+                button.setToolTip(action.toolTip())
+                button.setMinimumSize(36, 36)
         self._update_action_states()
 
     def _action(
@@ -812,17 +1306,58 @@ class MainWindow(QMainWindow):
         if shortcut is not None:
             action.setShortcut(shortcut)
         action.setCheckable(checkable)
+        action.setToolTip(text.replace("…", ""))
+        action.setStatusTip(action.toolTip())
         action.triggered.connect(callback)
+        return action
+
+    def _view_mode_action(self, text: str, shortcut: str, mode: str) -> QAction:
+        action = self._action(
+            text,
+            shortcut,
+            lambda _checked=False, mode=mode: self.set_view_mode(mode),
+            checkable=True,
+        )
+        self.view_mode_actions.addAction(action)
         return action
 
     def _connect_widgets(self) -> None:
         self.page_sidebar.page_selected.connect(self._select_page)
         self.image_viewer.block_selected.connect(self._select_block)
+        self.image_viewer.selection_changed.connect(self._selection_changed)
         self.image_viewer.block_created.connect(self._create_block)
         self.image_viewer.block_changed.connect(self._replace_block)
         self.image_viewer.block_deleted.connect(self._delete_block)
         self.block_editor.block_changed.connect(self._edit_block)
         self.block_editor.delete_requested.connect(self._delete_block_from_editor)
+        self.block_editor.ocr_requested.connect(lambda _block_id: self.ocr_selected_block())
+        self.block_editor.translate_requested.connect(
+            lambda _block_id: self.translate_selected_block()
+        )
+        self.block_strip.block_selected.connect(self._select_block_from_strip)
+        self.block_strip.delete_requested.connect(self._delete_block_from_strip)
+        for source, target in (
+            (self.image_viewer, self.preview_viewer),
+            (self.preview_viewer, self.image_viewer),
+        ):
+            source.view_transform_changed.connect(
+                lambda source=source, target=target: self._sync_view_transform(source, target)
+            )
+            source.view_transform_changed.connect(self._update_zoom_label)
+            source.horizontalScrollBar().valueChanged.connect(
+                lambda _value, source=source, target=target: self._sync_scrollbar(
+                    source.horizontalScrollBar(), target.horizontalScrollBar()
+                )
+            )
+            source.verticalScrollBar().valueChanged.connect(
+                lambda _value, source=source, target=target: self._sync_scrollbar(
+                    source.verticalScrollBar(), target.verticalScrollBar()
+                )
+            )
+
+    def _selection_changed(self, state: tuple[tuple[UUID, ...], UUID | None]) -> None:
+        selected_ids, primary_id = state
+        self.block_strip.set_selected_block_ids(selected_ids, primary_id=primary_id)
 
     def _choose_project_directory(self) -> None:
         directory = QFileDialog.getExistingDirectory(self, "Open Project Directory")
@@ -914,8 +1449,67 @@ class MainWindow(QMainWindow):
         output_dir = QFileDialog.getExistingDirectory(self, "Choose Export Directory")
         if not output_dir:
             return
-        if self._ensure_thai_font():
-            self.start_export(output_dir, self._thai_font_path)
+        if not self._ensure_thai_font():
+            return
+        watermark_mode, accepted = QInputDialog.getItem(
+            self,
+            "Export Watermark",
+            "Watermark on every page:",
+            ["None", "Text", "Logo image"],
+            1,
+            editable=False,
+        )
+        if not accepted:
+            return
+        watermark_text = None
+        watermark_logo_path = None
+        if watermark_mode == "Text":
+            watermark_text, accepted = QInputDialog.getText(
+                self,
+                "Watermark Text",
+                "Text:",
+                text="แปลหลังเลิกงาน",
+            )
+            watermark_text = watermark_text.strip()
+            if not accepted or not watermark_text:
+                return
+        elif watermark_mode == "Logo image":
+            watermark_logo_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Choose Watermark Logo",
+                filter="Images (*.png *.jpg *.jpeg *.webp)",
+            )
+            if not watermark_logo_path:
+                return
+
+        banner_mode, accepted = QInputDialog.getItem(
+            self,
+            "Export Banner",
+            "Insert one banner image:",
+            ["None", "First page", "Last page"],
+            editable=False,
+        )
+        if not accepted:
+            return
+        banner_path = None
+        banner_position = "end"
+        if banner_mode != "None":
+            banner_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Choose Banner Image",
+                filter="Images (*.png *.jpg *.jpeg *.webp)",
+            )
+            if not banner_path:
+                return
+            banner_position = "start" if banner_mode == "First page" else "end"
+        self.start_export(
+            output_dir,
+            self._thai_font_path,
+            watermark_text=watermark_text,
+            watermark_logo_path=watermark_logo_path,
+            banner_path=banner_path,
+            banner_position=banner_position,
+        )
 
     def _choose_thai_font(self) -> bool:
         font_path, _ = QFileDialog.getOpenFileName(
@@ -935,6 +1529,9 @@ class MainWindow(QMainWindow):
             self._report_error("Could not select Thai font: invalid font file")
             return False
         self._thai_font_path = path
+        self.block_editor.set_thai_font_label(path.name)
+        self._render_metrics.clear()
+        self.block_editor.set_render_metric(None)
         message = f"Thai font selected: {path.name}"
         self.choose_thai_font_action.setToolTip(message)
         self.statusBar().showMessage(message)
@@ -951,13 +1548,27 @@ class MainWindow(QMainWindow):
         self.set_translation_configuration(dialog.configuration())
         return True
 
+    def _configure_iopaint(self) -> bool:
+        dialog = IOPaintSettingsDialog(self._iopaint_configuration, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+        try:
+            configuration = dialog.configuration()
+        except ValueError as error:
+            self._report_error(f"Could not configure IOPaint: {error}")
+            return False
+        self.set_iopaint_configuration(configuration)
+        self.statusBar().showMessage("IOPaint is configured for direct CLI cleanup.")
+        self._update_action_states()
+        return True
+
     def _create_language_toolbar(self) -> None:
         self.project_language_combo = QComboBox()
         for language in SourceLanguage:
             self.project_language_combo.addItem(language.value, language.value)
 
         self.page_language_combo = QComboBox()
-        self.page_language_combo.addItem("inherit", None)
+        self.page_language_combo.addItem("Inherit from project", None)
         for language in SourceLanguage:
             self.page_language_combo.addItem(language.value, language.value)
 
@@ -965,9 +1576,19 @@ class MainWindow(QMainWindow):
         self.ocr_mode_combo.addItem("Mock (offline)", "mock")
         self.ocr_mode_combo.addItem("Installed local", "installed-local")
         self.effective_provider_label = QLabel("Effective: no page")
+        self.project_language_combo.setAccessibleName("Project source language")
+        self.project_language_combo.setToolTip("Choose the project's default source language.")
+        self.page_language_combo.setAccessibleName("Page source-language override")
+        self.page_language_combo.setToolTip(
+            "Choose this page's source language, or inherit the project setting."
+        )
+        self.ocr_mode_combo.setAccessibleName("OCR mode")
+        self.ocr_mode_combo.setToolTip("Choose Mock or installed local OCR.")
+        self.effective_provider_label.setAccessibleName("Effective OCR provider")
 
         toolbar = QToolBar("Language and OCR")
         toolbar.setObjectName("language_ocr_toolbar")
+        toolbar.setAccessibleName("Language and OCR toolbar")
         toolbar.addWidget(QLabel("Project language"))
         toolbar.addWidget(self.project_language_combo)
         toolbar.addSeparator()
@@ -1076,7 +1697,7 @@ class MainWindow(QMainWindow):
     def _build_translation_provider(self) -> TranslationProvider:
         configuration = self._translation_configuration
         if configuration is None:
-            raise ValueError("configure a translation provider first")
+            raise ValueError("configure a Translation Provider first")
         if configuration.provider == "openai-compatible":
             return OpenAICompatibleTranslationProvider(
                 configuration,
@@ -1095,16 +1716,29 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.workflow_log = QPlainTextEdit()
         self.workflow_log.setReadOnly(True)
+        self.workflow_log.setTabChangesFocus(True)
+        self.workflow_log.setAccessibleName("Activity log")
+        self.workflow_log.setToolTip("Log of workflow progress and errors.")
 
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.addWidget(self.progress_label)
         layout.addWidget(self.progress_bar)
         layout.addWidget(self.workflow_log)
-        self.progress_dock = QDockWidget("Workflow Progress", self)
+        self.progress_dock = QDockWidget("Activity", self)
         self.progress_dock.setObjectName("workflow_progress_dock")
+        self.progress_dock.setAccessibleName("Activity")
         self.progress_dock.setWidget(content)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.progress_dock)
+        self.progress_dock.hide()
+        self.status_progress = QProgressBar()
+        self.status_progress.setRange(0, 1)
+        self.status_progress.setValue(0)
+        self.status_progress.setTextVisible(False)
+        self.status_progress.setFixedSize(180, 8)
+        self.status_progress.setAccessibleName("Workflow progress")
+        self.status_progress.hide()
+        self.statusBar().addPermanentWidget(self.status_progress)
 
     def _current_page(self) -> Page | None:
         if self._project is None or self._current_page_id is None:
@@ -1134,6 +1768,8 @@ class MainWindow(QMainWindow):
         self._current_block_id = None
         self.block_editor.set_block(None)
         self.preview_viewer.set_page(None)
+        self.block_strip.set_page(None)
+        self.image_viewer.clear_selection()
         self._sync_language_controls()
         image_path = Path(page.source_path)
         if not image_path.is_absolute() and self._project_dir is not None:
@@ -1141,6 +1777,7 @@ class MainWindow(QMainWindow):
         if not image_path.is_file():
             self.image_viewer.set_page(None)
             self.statusBar().showMessage(f"Could not load image: {image_path}")
+            self._update_action_states()
             return
 
         viewer_page = page.model_copy(update={"source_path": str(image_path)})
@@ -1149,7 +1786,9 @@ class MainWindow(QMainWindow):
         except Exception as error:
             self.image_viewer.set_page(None)
             self.statusBar().showMessage(f"Could not load image: {error}")
+            self._update_action_states()
             return
+        self._refresh_block_strip(viewer_page)
         self._load_page_preview(page)
         self._fit_viewers()
         self.statusBar().showMessage(
@@ -1173,14 +1812,28 @@ class MainWindow(QMainWindow):
             self.preview_viewer.set_page(None)
             self._append_log(f"Could not load Thai preview: {error}")
 
-    def _select_block(self, block_id: UUID) -> None:
+    def _select_block(self, block_id: UUID | None) -> None:
         page = self._current_page()
-        if page is None:
+        if page is None or block_id is None:
+            self._current_block_id = None
             self.block_editor.set_block(None)
+            self.block_strip.set_selected_block_ids(())
+            self._update_action_states()
             return
         block = next((candidate for candidate in page.blocks if candidate.id == block_id), None)
         self._current_block_id = block.id if block is not None else None
+        self.block_editor.set_image_bounds(page.width, page.height)
         self.block_editor.set_block(block)
+        self.block_strip.set_selected_block_ids(
+            self.image_viewer.selected_block_ids,
+            primary_id=self._current_block_id,
+        )
+        self.block_editor.set_thai_font_label(
+            self._thai_font_path.name if self._thai_font_path is not None else None
+        )
+        self.block_editor.set_render_metric(
+            self._render_metrics.get(block.id) if block is not None else None
+        )
         self._update_effective_provider_label()
         self._update_action_states()
 
@@ -1194,9 +1847,11 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Block already exists: {block.id}")
             return
         page.blocks.append(block)
+        self._refresh_block_strip(page)
         self._refresh_sidebar()
         self.image_viewer.select_block(block.id)
-        self.block_editor.set_block(block)
+        self._select_block(block.id)
+        self._update_action_states()
 
     def _replace_block(self, block: TextBlock, *, update_editor: bool = True) -> None:
         page = self._current_page()
@@ -1204,16 +1859,73 @@ class MainWindow(QMainWindow):
             return
         for index, candidate in enumerate(page.blocks):
             if candidate.id == block.id:
+                preview_changed = self._preview_fields_changed(candidate, block)
+                strip_changed = self._block_strip_fields_changed(candidate, block)
                 page.blocks[index] = block
                 if update_editor:
                     self.block_editor.set_block(block)
+                if strip_changed:
+                    self._refresh_block_strip(page)
+                if preview_changed:
+                    self._render_metrics.pop(block.id, None)
+                    if self._current_block_id == block.id:
+                        self.block_editor.set_render_metric(None)
                 return
 
+    @staticmethod
+    def _preview_fields_changed(previous: TextBlock, current: TextBlock) -> bool:
+        return any(getattr(previous, field) != getattr(current, field) for field in _PREVIEW_FIELDS)
+
+    @staticmethod
+    def _block_strip_fields_changed(previous: TextBlock, current: TextBlock) -> bool:
+        return (
+            previous.bbox != current.bbox
+            or previous.reading_order != current.reading_order
+            or previous.source_text != current.source_text
+            or previous.status != current.status
+        )
+
     def _edit_block(self, block: TextBlock) -> None:
+        editor_needs_sync = False
+        current = self._current_block()
+        if current is not None and (
+            block.bbox != current.bbox or block.rotation_degrees != current.rotation_degrees
+        ):
+            fitted = self.image_viewer.fit_block_to_image(block)
+            editor_needs_sync = fitted != block
+            block = fitted
         self._replace_block(block, update_editor=False)
         self.image_viewer.update_block(block)
+        if editor_needs_sync:
+            self.block_editor.set_block(block)
         self._update_effective_provider_label()
         self._update_action_states()
+
+    def _refresh_block_strip(self, page: Page) -> None:
+        path = Path(page.source_path)
+        if not path.is_absolute() and self._project_dir is not None:
+            path = self._project_dir / path
+        if not path.is_file():
+            self.block_strip.set_page(None)
+            return
+        self.block_strip.set_page(page.model_copy(update={"source_path": str(path)}))
+        self.block_strip.set_selected_block_ids(
+            self.image_viewer.selected_block_ids,
+            primary_id=self._current_block_id,
+        )
+
+    def _select_block_from_strip(self, block_id: UUID) -> None:
+        selected = self.block_strip.selected_block_ids
+        self.image_viewer.set_selected_block_ids(selected, primary_id=block_id)
+
+    def _delete_block_from_strip(self, block_id: UUID) -> None:
+        self.image_viewer.select_block(block_id)
+        self.image_viewer.delete_selected_block()
+
+    def _preview_metric_received(self, metric: RenderMetric) -> None:
+        self._render_metrics[metric.block_id] = metric
+        if self._current_block_id == metric.block_id:
+            self.block_editor.set_render_metric(metric)
 
     def _delete_block_from_editor(self, block_id: UUID) -> None:
         self.image_viewer.select_block(block_id)
@@ -1226,37 +1938,68 @@ class MainWindow(QMainWindow):
         page = self._current_page()
         if page is None:
             return
+        deleted = next((block for block in page.blocks if block.id == block_id), None)
+        if deleted is None:
+            return
+        was_selected = block_id in self.image_viewer.selected_block_ids
+        was_current = self._current_block_id == block_id
         original_count = len(page.blocks)
         page.blocks[:] = [block for block in page.blocks if block.id != block_id]
         if len(page.blocks) == original_count:
             return
-        if self._current_block_id == block_id:
-            self._current_block_id = None
-        self.block_editor.set_block(None)
+        self._render_metrics.pop(block_id, None)
+        remaining = tuple(
+            selected_id
+            for selected_id in self.image_viewer.selected_block_ids
+            if selected_id != block_id
+        )
+        self.image_viewer.set_selected_block_ids(remaining)
+        if was_selected or was_current:
+            self._current_block_id = self.image_viewer.selected_block_id
+        self.block_editor.set_block(self._current_block())
+        self._refresh_block_strip(page)
         self._refresh_sidebar()
+        self._update_action_states()
 
     def _refresh_sidebar(self) -> None:
         if self._project is None:
             return
         current_id = self._current_page_id
+        blocker = QSignalBlocker(self.page_sidebar)
         self.page_sidebar.set_pages(self._project.pages)
         if current_id is not None:
             self.page_sidebar.select_page(current_id)
+        del blocker
 
     def _replace_project_preserving_page(self, project: Project) -> None:
-        self._replace_project_with_selection(project, self._current_page_id, self._current_block_id)
+        selected_block_ids = self.image_viewer.selected_block_ids
+        primary_block_id = self.image_viewer.selected_block_id
+        self._replace_project_with_selection(
+            project,
+            self._current_page_id,
+            primary_block_id,
+            selected_block_ids,
+        )
 
     def _replace_project_with_selection(
         self,
         project: Project,
         page_id: UUID | None,
         block_id: UUID | None,
+        selected_block_ids: tuple[UUID, ...] | None = None,
     ) -> None:
         project_dir = self._project_dir
         self.set_project(project, project_dir)
         if page_id is not None and any(page.id == page_id for page in project.pages):
             self.page_sidebar.select_page(page_id)
         page = self._current_page()
+        if selected_block_ids is not None and page is not None:
+            page_block_ids = {block.id for block in page.blocks}
+            valid_block_ids = tuple(
+                selected_id for selected_id in selected_block_ids if selected_id in page_block_ids
+            )
+            self.image_viewer.set_selected_block_ids(valid_block_ids, primary_id=block_id)
+            return
         if (
             block_id is not None
             and page is not None
@@ -1290,7 +2033,10 @@ class MainWindow(QMainWindow):
     def _workflow_progress(self, update: ProgressUpdate) -> None:
         self.progress_bar.setRange(0, max(1, update.total))
         self.progress_bar.setValue(update.current)
-        message = f"{update.stage.title()} {update.current}/{update.total}: {update.message}"
+        self.status_progress.setRange(0, max(1, update.total))
+        self.status_progress.setValue(update.current)
+        stage = _STAGE_LABELS.get(update.stage, update.stage)
+        message = f"{stage} {update.current}/{update.total}: {update.message}"
         self.progress_label.setText(message)
         self.statusBar().showMessage(message)
         self._append_log(message)
@@ -1298,10 +2044,22 @@ class MainWindow(QMainWindow):
     def _export_progress(self, update: ExportProgress) -> None:
         self.progress_bar.setRange(0, max(1, update.total))
         self.progress_bar.setValue(update.current)
+        self.status_progress.setRange(0, max(1, update.total))
+        self.status_progress.setValue(update.current)
         message = f"Export {update.current}/{update.total}: {update.message}"
         self.progress_label.setText(message)
         self.statusBar().showMessage(message)
         self._append_log(message)
+
+    def _cleanup_progress(self, update: CleanupProgress) -> None:
+        self.progress_bar.setRange(0, max(1, update.total))
+        self.progress_bar.setValue(update.current)
+        self.status_progress.setRange(0, max(1, update.total))
+        self.status_progress.setValue(update.current)
+        message = f"IOPaint {update.current}/{update.total}: {update.message}"
+        self.progress_label.setText(message)
+        self.statusBar().showMessage(message)
+        self._append_log(f"{message} (block_id={update.block_id})")
 
     def _workflow_completed(self, result: WorkflowResult) -> None:
         previous_page = self._current_page()
@@ -1321,7 +2079,10 @@ class MainWindow(QMainWindow):
             )
         for issue in result.issues:
             self._append_log(self._format_issue(issue))
-        message = f"{self._workflow_name} completed with {len(result.issues)} issue(s)."
+        if result.issues:
+            self.progress_dock.show()
+        label = _WORKFLOW_LABELS.get(self._workflow_name, self._workflow_name)
+        message = f"{label} completed with {_count_label(len(result.issues), 'issue')}."
         self.progress_label.setText(message)
         self.statusBar().showMessage(message)
         self._append_log(message)
@@ -1331,13 +2092,17 @@ class MainWindow(QMainWindow):
         self._replace_project_preserving_page(result.project)
         for issue in result.issues:
             self._append_log(self._format_issue(issue))
+        if result.issues:
+            self.progress_dock.show()
         if not self.save_project():
             self._report_error("Could not persist translated folder")
             return
         page = self._current_page()
         if page is not None:
             self._load_page_preview(page)
-        message = f"Translate folder images completed with {len(result.issues)} issue(s)."
+        message = (
+            f"Folder image translation completed with {_count_label(len(result.issues), 'issue')}."
+        )
         self.progress_label.setText(message)
         self.statusBar().showMessage(message)
         self._append_log(message)
@@ -1352,14 +2117,16 @@ class MainWindow(QMainWindow):
             self._append_log(f"Exported: {path}")
         for issue in result.issues:
             self._append_log(self._format_export_issue(issue))
+        if result.issues:
+            self.progress_dock.show()
         for warning in result.overflow_warnings:
             self._append_log(
                 f"Overflow warning: {warning.message}"
                 f"{self._format_location(warning.page_id, warning.block_id)}"
             )
         message = (
-            f"Export completed with {len(result.issues)} issue(s) and "
-            f"{len(result.overflow_warnings)} overflow warning(s)."
+            f"Export completed with {_count_label(len(result.issues), 'issue')} and "
+            f"{_count_label(len(result.overflow_warnings), 'overflow warning')}."
         )
         self.progress_label.setText(message)
         self.statusBar().showMessage(message)
@@ -1369,6 +2136,8 @@ class MainWindow(QMainWindow):
         page_id, path, warnings, issues = result
         for issue in issues:
             self._append_log(self._format_export_issue(issue))
+        if issues:
+            self.progress_dock.show()
         for warning in warnings:
             self._append_log(
                 f"Overflow warning: {warning.message}"
@@ -1377,34 +2146,82 @@ class MainWindow(QMainWindow):
         if self._current_page_id == page_id:
             try:
                 page = self._current_page()
-                self.preview_viewer.set_page(
-                    page.model_copy(update={"source_path": str(path), "blocks": []})
+                view_center = self.image_viewer.mapToScene(
+                    self.image_viewer.viewport().rect().center()
                 )
-                self.preview_viewer.fit_to_window()
+                self._syncing_viewers = True
+                try:
+                    self.preview_viewer.set_page(
+                        page.model_copy(update={"source_path": str(path), "blocks": []})
+                    )
+                    self.image_viewer.centerOn(view_center)
+                finally:
+                    self._syncing_viewers = False
+                self._sync_view_transform(self.image_viewer, self.preview_viewer)
             except Exception as error:
                 self._report_error(f"Could not show Thai preview: {error}")
                 return
-        message = f"Thai preview refreshed with {len(issues)} issue(s)."
+        message = f"Thai preview refreshed with {_count_label(len(issues), 'issue')}."
         self.progress_label.setText(message)
         self.statusBar().showMessage(message)
         self._append_log(message)
 
+    def _iopaint_cleanup_completed(self, path: Path) -> None:
+        self._append_log(f"IOPaint cleanup saved: {path}")
+        self._refresh_preview_after_translation = self._thai_font_path is not None
+        message = (
+            "IOPaint cleanup saved; refreshing Thai preview."
+            if self._refresh_preview_after_translation
+            else "IOPaint cleanup saved; choose a Thai font, then refresh Thai preview."
+        )
+        self.progress_label.setText(message)
+        self.statusBar().showMessage(message)
+        self._append_log(message)
+
+    def _iopaint_page_cleanup_completed(self, result: PageCleanupResult) -> None:
+        for path in result.paths:
+            self._append_log(f"IOPaint cleanup saved: {path}")
+        for issue in result.issues:
+            self._append_log(f"IOPaint cleanup issue: {issue.message} (block_id={issue.block_id})")
+        if result.issues:
+            self.progress_dock.show()
+        self._refresh_preview_after_translation = (
+            bool(result.paths) and self._thai_font_path is not None
+        )
+        message = (
+            f"IOPaint cleaned {_count_label(len(result.paths), 'block')} on the current page with "
+            f"{_count_label(len(result.issues), 'issue')}."
+        )
+        self.progress_label.setText(message)
+        self.statusBar().showMessage(message)
+        self._append_log(message)
+        if result.issues:
+            QMessageBox.warning(
+                self,
+                "IOPaint Cleanup Issues",
+                f"Cleanup failed for {_count_label(len(result.issues), 'block')}; original images were preserved. "
+                "See the Activity log and choose another cleanup method if needed.",
+            )
+
     def _workflow_cancelled(self) -> None:
         self._refresh_preview_after_translation = False
-        message = f"{self._workflow_name} cancelled."
+        label = _WORKFLOW_LABELS.get(self._workflow_name, self._workflow_name)
+        message = f"{label} cancelled."
         self.progress_label.setText(message)
         self.statusBar().showMessage(message)
         self._append_log(message)
 
     def _workflow_failed(self, message: str) -> None:
         self._refresh_preview_after_translation = False
-        self._report_error(f"{self._workflow_name} failed: {message}")
+        label = _WORKFLOW_LABELS.get(self._workflow_name, self._workflow_name)
+        self._report_error(f"{label} failed: {message}")
 
     def _workflow_thread_finished(self) -> None:
         refresh_preview = self._refresh_preview_after_translation
         self._refresh_preview_after_translation = False
         self._workflow_thread = None
         self._workflow_worker = None
+        self.status_progress.hide()
         self._update_action_states()
         if refresh_preview:
             self.refresh_thai_preview()
@@ -1426,6 +2243,7 @@ class MainWindow(QMainWindow):
         ):
             action.setEnabled(not busy)
         self.configure_translation_action.setEnabled(not busy)
+        self.configure_iopaint_action.setEnabled(not busy)
         self.choose_thai_font_action.setEnabled(not busy)
         self.import_images_action.setEnabled(has_project and has_project_dir and not busy)
         self.save_action.setEnabled(has_project and has_project_dir and not busy)
@@ -1443,13 +2261,39 @@ class MainWindow(QMainWindow):
             and not busy
         )
         self.cancel_workflow_action.setEnabled(busy)
+        self.cancel_workflow_action.setVisible(busy)
         self.previous_page_action.setEnabled(has_page and row > 0 and not busy)
         self.next_page_action.setEnabled(
             has_page and row < self.page_sidebar.count() - 1 and not busy
         )
+        page_index = (
+            next(
+                (
+                    index
+                    for index, candidate in enumerate(self._project.pages)
+                    if candidate.id == self._current_page_id
+                ),
+                None,
+            )
+            if self._project is not None
+            else None
+        )
+        self.move_page_earlier_action.setEnabled(
+            page_index is not None and page_index > 0 and not busy
+        )
+        self.move_page_later_action.setEnabled(
+            page_index is not None and page_index < len(self._project.pages) - 1 and not busy
+            if self._project is not None
+            else False
+        )
+        self.delete_page_action.setEnabled(has_page and not busy)
         page = self._current_page()
         has_blocks = page is not None and bool(page.blocks)
-        has_selected_block = self._current_block() is not None
+        selected_block_ids = self.image_viewer.selected_block_ids
+        has_selected_block = bool(selected_block_ids)
+        has_source_image = self.image_viewer._page is not None
+        has_preview_image = self.preview_viewer._page is not None
+        self.block_strip.setEnabled(has_page and not busy)
         self.ocr_selected_action.setEnabled(has_selected_block and not busy)
         self.ocr_page_action.setEnabled(has_page and not busy)
         self.ocr_all_action.setEnabled(has_project and bool(self._project.pages) and not busy)
@@ -1458,11 +2302,18 @@ class MainWindow(QMainWindow):
             and page is not None
             and any(block.status is BlockStatus.OCR_COMPLETE for block in page.blocks)
         )
+        self.confirm_ocr_all_action.setEnabled(
+            not busy
+            and self._project is not None
+            and any(
+                block.status is BlockStatus.OCR_COMPLETE
+                for candidate in self._project.pages
+                for block in candidate.blocks
+            )
+        )
         self.translate_selected_action.setEnabled(has_selected_block and not busy)
         self.translate_page_action.setEnabled(has_page and not busy)
         self.translate_all_action.setEnabled(has_project and bool(self._project.pages) and not busy)
-        self.previous_block_action.setEnabled(has_blocks and not busy)
-        self.next_block_action.setEnabled(has_blocks and not busy)
         ordered_blocks = (
             sorted(page.blocks, key=lambda block: (block.reading_order, str(block.id)))
             if page is not None
@@ -1476,17 +2327,51 @@ class MainWindow(QMainWindow):
             ),
             None,
         )
+        self.previous_block_action.setEnabled(
+            has_blocks and not busy and (selected_index is None or selected_index > 0)
+        )
+        self.next_block_action.setEnabled(
+            has_blocks
+            and not busy
+            and (selected_index is None or selected_index < len(ordered_blocks) - 1)
+        )
         self.move_block_earlier_action.setEnabled(
             selected_index is not None and selected_index > 0 and not busy
         )
         self.move_block_later_action.setEnabled(
             selected_index is not None and selected_index < len(ordered_blocks) - 1 and not busy
         )
-        self.draw_block_action.setEnabled(has_page and not busy)
-        self.refresh_preview_action.setEnabled(has_page and has_project_dir and not busy)
-        self.show_source_action.setEnabled(has_page and not busy)
+        self.draw_block_action.setEnabled(has_source_image and not busy)
+        self.refresh_preview_action.setEnabled(has_source_image and has_project_dir and not busy)
+        self.reclean_selected_action.setEnabled(
+            has_source_image and has_selected_block and has_project_dir and not busy
+        )
+        self.reclean_page_action.setEnabled(
+            has_source_image and has_page and has_project_dir and not busy
+        )
+        self.iopaint_clean_selected_action.setEnabled(
+            has_source_image and has_selected_block and has_project_dir and not busy
+        )
+        self.iopaint_clean_page_action.setEnabled(
+            has_source_image
+            and has_project_dir
+            and not busy
+            and page is not None
+            and bool(page.blocks)
+        )
+        self.prepare_manual_cleanup_action.setEnabled(
+            has_source_image and has_selected_block and has_project_dir and not busy
+        )
+        self.prepare_page_cleanups_action.setEnabled(
+            has_source_image
+            and has_project_dir
+            and not busy
+            and page is not None
+            and any(block.translated_text for block in page.blocks)
+        )
+        self.show_source_action.setEnabled(has_source_image and not busy)
         self.delete_block_action.setEnabled(
-            has_page and self.image_viewer.selected_block_id is not None and not busy
+            has_source_image and self.image_viewer.selected_block_id is not None and not busy
         )
         for action in (
             self.fit_action,
@@ -1494,7 +2379,15 @@ class MainWindow(QMainWindow):
             self.zoom_in_action,
             self.zoom_out_action,
         ):
-            action.setEnabled(has_page and not busy)
+            action.setEnabled(has_source_image and not busy)
+        source_view_enabled = has_source_image and not busy
+        preview_view_enabled = has_preview_image and not busy
+        for action in (self.split_view_action, self.original_view_action):
+            action.setEnabled(source_view_enabled)
+        self.preview_view_action.setEnabled(preview_view_enabled)
+        self.view_mode_buttons["split"].setEnabled(source_view_enabled)
+        self.view_mode_buttons["original"].setEnabled(source_view_enabled)
+        self.view_mode_buttons["preview"].setEnabled(preview_view_enabled)
         self.project_language_combo.setEnabled(has_project and not busy)
         self.page_language_combo.setEnabled(has_page and not busy)
         self.ocr_mode_combo.setEnabled(has_project and not busy)
@@ -1527,9 +2420,9 @@ class MainWindow(QMainWindow):
         return f" ({', '.join(location)})" if location else ""
 
     def _format_issue(self, issue: WorkflowIssue) -> str:
+        stage = _STAGE_LABELS.get(issue.stage, issue.stage)
         return (
-            f"{issue.stage.title()} issue: {issue.message}"
-            f"{self._format_location(issue.page_id, issue.block_id)}"
+            f"{stage} issue: {issue.message}{self._format_location(issue.page_id, issue.block_id)}"
         )
 
     def _format_export_issue(self, issue: ExportIssue) -> str:
@@ -1548,7 +2441,70 @@ class MainWindow(QMainWindow):
                 self._append_log(message)
                 event.ignore()
                 return
+        self._save_ui_state()
         event.accept()
+
+    def _restore_ui_state(self) -> None:
+        self.splitter.setSizes(
+            self._read_sizes(self._settings.value("main_splitter_sizes"), [240, 766, 360])
+        )
+        self._comparison_split_sizes = self._read_sizes(
+            self._settings.value("comparison_splitter_sizes"), [1, 1], count=2
+        )
+        self.comparison_splitter.setSizes(self._comparison_split_sizes)
+        navigator_index = self._read_index(
+            self._settings.value("navigator_tab"), self.navigator_tabs.count()
+        )
+        inspector_index = self._read_index(
+            self._settings.value("inspector_tab"), self.block_editor.tabs.count()
+        )
+        self.navigator_tabs.setCurrentIndex(navigator_index)
+        self.block_editor.tabs.setCurrentIndex(inspector_index)
+        if self._read_bool(self._settings.value("activity_visible")):
+            self.progress_dock.show()
+        self.set_view_mode("split")
+
+    def _save_ui_state(self) -> None:
+        self._settings.setValue("main_splitter_sizes", self.splitter.sizes())
+        sizes = (
+            self.comparison_splitter.sizes()
+            if not self.original_pane.isHidden() and not self.preview_pane.isHidden()
+            else self._comparison_split_sizes
+        )
+        self._settings.setValue("comparison_splitter_sizes", sizes)
+        self._settings.setValue("navigator_tab", self.navigator_tabs.currentIndex())
+        self._settings.setValue("inspector_tab", self.block_editor.tabs.currentIndex())
+        self._settings.setValue("activity_visible", not self.progress_dock.isHidden())
+        self._settings.sync()
+
+    @staticmethod
+    def _read_sizes(value: object, default: list[int], *, count: int = 3) -> list[int]:
+        if not isinstance(value, (list, tuple)) or len(value) != count:
+            return default
+        try:
+            sizes = [int(item) for item in value]
+        except (TypeError, ValueError):
+            return default
+        return sizes if all(size > 0 for size in sizes) else default
+
+    @staticmethod
+    def _read_index(value: object, count: int) -> int:
+        try:
+            index = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return index if 0 <= index < count else 0
+
+    @staticmethod
+    def _read_bool(value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value).casefold() in {"1", "true", "yes"}
+
+    def _set_focus_order(self) -> None:
+        QWidget.setTabOrder(self.navigator_tabs, self.image_viewer)
+        QWidget.setTabOrder(self.image_viewer, self.block_editor.tabs)
+        QWidget.setTabOrder(self.block_editor.tabs, self.workflow_log)
 
     def _select_adjacent_block(self, offset: int) -> None:
         page = self._current_page()
@@ -1586,6 +2542,7 @@ class MainWindow(QMainWindow):
             return
         blocks[current], blocks[current + offset] = blocks[current + offset], blocks[current]
         page.blocks = normalize_reading_order(blocks)
+        self._refresh_block_strip(page)
         self._refresh_sidebar()
         self.image_viewer.select_block(selected_id)
         self._select_block(selected_id)

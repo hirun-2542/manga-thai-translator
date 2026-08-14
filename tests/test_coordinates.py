@@ -2,7 +2,13 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from app.core.coordinates import CoordinateTransform, clamp_bbox, normalize_bbox
+from app.core.coordinates import (
+    CoordinateTransform,
+    clamp_bbox,
+    normalize_bbox,
+    rotated_bbox_bounds,
+    rotated_bbox_corners,
+)
 from app.core.models import BoundingBox
 
 
@@ -43,6 +49,17 @@ def test_clamp_bbox_uses_image_coordinates() -> None:
     )
 
 
+def test_clamp_bbox_preserves_in_bounds_float_geometry() -> None:
+    bbox = BoundingBox(
+        x=203,
+        y=2444,
+        width=287.7,
+        height=160.80000000000018,
+    )
+
+    assert clamp_bbox(bbox, image_width=690, image_height=16_000) is bbox
+
+
 def test_clamp_bbox_rejects_box_outside_image() -> None:
     with pytest.raises(ValueError, match="no area"):
         clamp_bbox(
@@ -50,3 +67,13 @@ def test_clamp_bbox_rejects_box_outside_image() -> None:
             image_width=100,
             image_height=100,
         )
+
+
+def test_rotated_bbox_uses_fixed_center_and_clockwise_image_axes() -> None:
+    bbox = BoundingBox(x=10, y=20, width=40, height=20)
+
+    corners = rotated_bbox_corners(bbox, 90)
+
+    for actual, expected in zip(corners, ((40, 10), (40, 50), (20, 50), (20, 10))):
+        assert actual == pytest.approx(expected)
+    assert rotated_bbox_bounds(bbox, 90) == BoundingBox(x=20, y=10, width=20, height=40)
