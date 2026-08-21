@@ -13,6 +13,7 @@ from app.core.models import (
     ProviderConfiguration,
     ReadingOrderPreset,
     SourceLanguage,
+    TextAlignment,
     TextBlock,
     TranslationInput,
     WritingMode,
@@ -35,6 +36,7 @@ def test_public_enums_have_specified_values() -> None:
         "custom",
     }
     assert {item.value for item in WritingMode} >= {"horizontal", "vertical"}
+    assert {item.value for item in TextAlignment} == {"left", "center", "right"}
     assert {item.value for item in BlockStatus} == {
         "detected",
         "language_review_required",
@@ -58,6 +60,17 @@ def test_project_page_and_block_get_distinct_uuid_defaults() -> None:
     assert projects[0].id != projects[1].id
     assert page.id != block.id
     assert projects[0].settings.target_language == "th"
+    assert block.typesetting_font_size is None
+    assert block.typesetting_line_spacing is None
+    assert block.typesetting_alignment is TextAlignment.CENTER
+    assert block.rotation_degrees == 0.0
+    assert block.mirror_horizontal is False
+    assert block.mirror_vertical is False
+    assert block.typesetting_font_family is None
+    assert block.typesetting_font_style is None
+    assert block.typesetting_fill_color is None
+    assert block.typesetting_stroke_color is None
+    assert block.typesetting_stroke_width == 0
 
 
 def test_project_round_trip_preserves_ids_and_multilingual_text() -> None:
@@ -69,6 +82,7 @@ def test_project_round_trip_preserves_ids_and_multilingual_text() -> None:
             reading_order=index,
             source_language=language,
             source_text=text,
+            typesetting_line_spacing=index * 2,
         )
         for index, (language, text) in enumerate(
             [
@@ -98,7 +112,42 @@ def test_project_round_trip_preserves_ids_and_multilingual_text() -> None:
     assert restored == project
     assert restored.id == project.id
     assert [block.id for block in restored.pages[0].blocks] == [block.id for block in blocks]
+    assert [block.typesetting_line_spacing for block in restored.pages[0].blocks] == [0, 2, 4, 6, 8]
     assert restored.created_at.utcoffset().total_seconds() == 0
+
+
+def test_typesetting_overrides_round_trip_and_validate_rgb_values() -> None:
+    block = TextBlock(
+        page_id=uuid4(),
+        bbox=BoundingBox(x=0, y=0, width=10, height=10),
+        reading_order=0,
+        typesetting_font_family="Noto Sans Thai",
+        typesetting_font_style="Bold",
+        typesetting_fill_color="#102030",
+        typesetting_stroke_color="#A0B0C0",
+        typesetting_stroke_width=0,
+        typesetting_alignment=TextAlignment.RIGHT,
+    )
+
+    restored = TextBlock.model_validate_json(block.model_dump_json())
+
+    assert restored == block
+    assert restored.typesetting_alignment is TextAlignment.RIGHT
+    for kwargs in (
+        {"typesetting_font_style": "Bold"},
+        {"typesetting_fill_color": "#12345"},
+        {"typesetting_fill_color": "rgba(0, 0, 0, 0.5)"},
+        {"typesetting_stroke_width": -1},
+        {"typesetting_stroke_width": 33},
+        {"typesetting_alignment": "justify"},
+    ):
+        with pytest.raises(ValidationError):
+            TextBlock(
+                page_id=uuid4(),
+                bbox=BoundingBox(x=0, y=0, width=10, height=10),
+                reading_order=0,
+                **kwargs,
+            )
 
 
 @pytest.mark.parametrize(
@@ -109,6 +158,11 @@ def test_project_round_trip_preserves_ids_and_multilingual_text() -> None:
         (Page, "width", 0),
         (TextBlock, "reading_order", -1),
         (TextBlock, "ocr_confidence", 1.01),
+        (TextBlock, "typesetting_font_size", 7),
+        (TextBlock, "typesetting_font_size", 257),
+        (TextBlock, "typesetting_line_spacing", -1),
+        (TextBlock, "typesetting_line_spacing", 257),
+        (TextBlock, "rotation_degrees", 180.1),
     ],
 )
 def test_numeric_validation(model: type, field: str, value: object) -> None:
@@ -128,9 +182,9 @@ def test_numeric_validation(model: type, field: str, value: object) -> None:
 
 
 def test_schema_version_and_extra_fields_are_rejected() -> None:
-    assert SCHEMA_VERSION == 1
+    assert SCHEMA_VERSION == 2
     with pytest.raises(ValidationError):
-        Project(name="test", schema_version=2)
+        Project(name="test", schema_version=1)
     with pytest.raises(ValidationError):
         Project(name="test", api_key="secret")
 

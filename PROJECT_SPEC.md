@@ -1,7 +1,7 @@
 # Manga Thai Translator — Project Specification
 
 > Specification version: `3.1.0`  
-> Updated: `2026-07-31`  
+> Updated: `2026-08-11`
 > Status: MVP baseline  
 > Source languages: `ja`, `en`, `ko`, `zh-Hans`, `zh-Hant`, `auto`  
 > Target language: Thai (`th`)
@@ -453,7 +453,7 @@ Text Block Editor ต้องมี:
 - Save
 - Previous/Next Page
 - Previous/Next Block
-- Confirm OCR
+- Confirm OCR สำหรับหน้าปัจจุบันหรือทุกหน้า
 - Confirm Translation
 - Delete Block
 - Fit image
@@ -478,7 +478,8 @@ MVP ต้อง Export:
 - TXT
 - ภาพ Preview
 
-JSON ต้องรักษา Page, Block ID, Bounding Box, Reading Order, Source Language, Writing Mode, OCR Provider, Source, Translation, Speaker, Note และ Status
+JSON ต้องรักษา Page, Block ID, Bounding Box, Region Rotation, Text Mirror, Text Alignment, Reading Order,
+Source Language, Writing Mode, OCR Provider, Source, Translation, Speaker, Note และ Status
 
 CSV ต้องมีอย่างน้อย:
 
@@ -492,6 +493,9 @@ CSV ต้องมีอย่างน้อย:
 - Translation
 - Note
 - Status
+- Text Alignment
+- Region Rotation
+- Text Mirror แนวนอนและแนวตั้ง
 
 TXT ต้องเรียงตาม:
 
@@ -508,8 +512,25 @@ TXT ต้องเรียงตาม:
 - ทำเครื่องหมาย Block ที่ล้น
 - ห้ามเขียนทับต้นฉบับ
 - MVP ใช้พื้นหลังสีขาวหรือสีที่ผู้ใช้เลือกภายในกรอบได้
+- หมุนทั้ง Region รอบจุดกึ่งกลางด้วยมุมเดียวสำหรับ Selection, Resize, Cleanup และ Export
+- กลับเฉพาะข้อความปลายทางตามแกนภายใน Region ได้ทั้งแนวนอนและแนวตั้ง
 
-Inpainting ซับซ้อนยังไม่อยู่ใน MVP
+### 3.14 Rotated Region and Local IOPaint Cleanup
+
+- `bbox` เก็บกรอบก่อนหมุนในพิกัดภาพจริง และ Region มีมุมเดียวในช่วง `-180..180`
+- UI มี Drag Handle แบบ Adobe และช่ององศาที่แก้ค่าเดียวกัน จุดหมุนยึดกึ่งกลางกรอบ
+- โปรเจกต์ Schema v1 ต้องย้าย Thai text rotation เดิมเป็น canonical Region rotation และ
+  บันทึกเป็น Schema v2 โดยไม่ทำข้อมูลอื่นหาย
+- Mirror แนวนอนและแนวตั้งเป็นอิสระ เปิดพร้อมกันได้ และมีผลเฉพาะข้อความปลายทาง
+- Text Block เลือกจัดข้อความไทยชิดซ้าย กึ่งกลาง หรือชิดขวาตามแกนภายใน Region ได้
+- IOPaint ใช้ CLI โดยตรงหนึ่ง Process ต่อ Cleanup ด้วยค่าเริ่มต้น
+  `iopaint run --model=lama --device=cpu --image INPUT --mask MASK --output OUTPUT`
+- รองรับ Selected Block และ Current Page; งานระดับหน้าต้องมี Progress/Cancel และ Error
+  ของ Block หนึ่งต้องไม่หยุด Block ถัดไป
+- หาก CLI, Timeout หรือ Inference ล้มเหลว ต้องแจ้ง Error รักษาภาพเดิม และห้าม
+  Silent Fallback ไป Cleanup วิธีอื่น
+- Executable, Model, Device และ Operation Timeout แก้ได้ใน Runtime Settings แต่ห้ามบันทึกใน
+  `project.json`
 
 ## 4. Suggested Architecture
 
@@ -752,7 +773,7 @@ MVP ถือว่าเสร็จเมื่อ:
 เสนอและประเมินแยกจาก MVP:
 
 - Speech-bubble detection ที่แม่นยำขึ้น
-- Inpainting ลบข้อความเดิม
+- Inpainting ขั้นสูงหรือ Batch ทั้งโปรเจกต์นอกเหนือ IOPaint ระดับ Block/Page
 - จัดคำไทยลงบอลลูนอัตโนมัติขั้นสูง
 - PDF และ CBZ
 - Translation Memory

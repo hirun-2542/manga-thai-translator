@@ -11,6 +11,6 @@ enabled = true
 max_concurrent_threads_per_session = 3
 
 # Fallback settings for every spawned agent unless a custom role overrides them.
-default_subagent_model = "gpt-5.6-sol"
-default_subagent_reasoning_effort = "medium"
+default_subagent_model = "gpt-5.6-luna"
+default_subagent_reasoning_effort = "xhigh"
 interrupt_message = true

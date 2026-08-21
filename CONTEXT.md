@@ -1,7 +1,7 @@
 # Project Context — Manga Thai Translator
 
 > Document version: `3.1.0`  
-> Updated: `2026-07-31`  
+> Updated: `2026-08-11`
 > Target language: Thai (`th`)  
 > Revision focus: mixed-language input, provider routing, privacy, and Codex agent/runtime separation
 
@@ -238,3 +238,18 @@ Cloud Provider ต้องรับเฉพาะข้อความแล�
 - Source files immutable
 - Mock-first development ก่อนเชื่อม Model จริง
 - Phase 2 ไม่เริ่มจนกว่า MVP Acceptance Criteria ผ่าน
+
+## Geometry Language
+
+**Rotated Text Region**:
+พื้นที่ข้อความบนหน้าที่มีทิศทางเป็นส่วนหนึ่งของขอบเขต การเลือก การรู้จำ การทำความสะอาด
+และการจัดวางข้อความต้องอ้างอิงขอบเขตเอียงเดียวกัน Region เป็นเจ้าของมุมเพียงค่าเดียว
+และทุกขั้นตอนใช้มุมนั้นร่วมกัน
+_Avoid_: หมุนเฉพาะข้อความ, กรอบตรงที่แสดงผลเหมือนหมุน
+
+**Text Mirror**:
+การกลับข้อความไทยของแต่ละ Text Block ตามแนวนอนหรือแนวตั้ง โดยมีผลใน Thai Preview
+และ Export เท่านั้น ไม่กลับภาพพื้นหลัง ขอบเขต OCR หรือพื้นที่ Clean แกน Mirror อ้างอิง
+coordinate space ภายใน Region ตามแนวข้อความก่อนใช้มุมหมุนของ Region ทั้งสองแกนเป็นอิสระ
+และเปิดพร้อมกันได้
+_Avoid_: Invert color, กลับทั้งหน้า, กลับภาพต้นฉบับ

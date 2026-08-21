@@ -3,7 +3,13 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from app.core.models import BoundingBox, Project, SourceLanguage, TextBlock
+from app.core.models import (
+    BoundingBox,
+    Project,
+    ReadingOrderPreset,
+    SourceLanguage,
+    TextBlock,
+)
 from app.persistence.project_repository import ProjectRepository
 from app.services.project_service import ProjectService
 
@@ -194,3 +200,129 @@ def test_import_rejects_duplicate_source_without_changing_project(tmp_path: Path
 
     assert len(project.pages) == 1
     assert (project_dir / "project.json").read_bytes() == saved
+
+
+def test_open_image_folder_creates_reopens_and_syncs_hidden_workspace(tmp_path: Path) -> None:
+    images = tmp_path / "มังงะไทย"
+    paths = [
+        make_image(images / "หน้า10.PNG", color="red"),
+        make_image(images / "หน้า2.jpg", color="green"),
+        make_image(images / "หน้า1.jpeg", color="blue"),
+        make_image(images / "หน้า3.webp", color="purple"),
+    ]
+    original_bytes = {path: path.read_bytes() for path in paths}
+
+    project, workspace = ProjectService.open_image_folder(images)
+
+    assert workspace == images / ".manga-thai-translator"
+    assert [Path(page.source_path).name for page in project.pages] == [
+        "หน้า1.jpeg",
+        "หน้า2.jpg",
+        "หน้า3.webp",
+        "หน้า10.PNG",
+    ]
+    assert all(Path(page.source_path).is_absolute() for page in project.pages)
+    assert project.settings.default_source_language is SourceLanguage.AUTO
+    assert project.settings.default_reading_order is ReadingOrderPreset.WEBTOON_VERTICAL
+    assert (workspace / "project.json").is_file()
+    assert list((workspace / "source").iterdir()) == []
+
+    preserved_page = project.pages[1]
+    preserved_block = TextBlock(
+        page_id=preserved_page.id,
+        bbox=BoundingBox(x=1, y=2, width=3, height=4),
+        reading_order=1,
+        translated_text="เก็บฉันไว้",
+    )
+    preserved_page.blocks = [preserved_block]
+    ProjectRepository.save(project, workspace)
+    new_path = make_image(images / "หน้า4.png", color="orange")
+    original_bytes[new_path] = new_path.read_bytes()
+
+    reopened, reopened_workspace = ProjectService.open_image_folder(
+        images,
+        default_source_language=SourceLanguage.JA,
+        default_reading_order=ReadingOrderPreset.MANGA_RTL,
+    )
+
+    assert reopened_workspace == workspace
+    assert [Path(page.source_path).name for page in reopened.pages] == [
+        "หน้า1.jpeg",
+        "หน้า2.jpg",
+        "หน้า3.webp",
+        "หน้า4.png",
+        "หน้า10.PNG",
+    ]
+    restored = next(page for page in reopened.pages if page.id == preserved_page.id)
+    assert restored.blocks[0].id == preserved_block.id
+    assert restored.blocks[0].translated_text == "เก็บฉันไว้"
+    assert reopened.settings.default_source_language is SourceLanguage.AUTO
+    assert reopened.settings.default_reading_order is ReadingOrderPreset.WEBTOON_VERTICAL
+    assert ProjectRepository.load(workspace) == reopened
+    assert all(path.read_bytes() == content for path, content in original_bytes.items())
+
+
+def test_open_image_files_creates_reopens_adds_and_is_idempotent(tmp_path: Path) -> None:
+    images = tmp_path / "ภาพที่เลือก"
+    unselected = make_image(images / "หน้า3.png", color="green")
+    selected = [
+        make_image(images / "หน้า10.webp", color="red"),
+        make_image(images / "หน้า2.jpeg", color="blue"),
+        make_image(images / "หน้า1.JPG", color="purple"),
+    ]
+    original_bytes = {path: path.read_bytes() for path in [unselected, *selected]}
+
+    project, workspace = ProjectService.open_image_files(selected)
+
+    assert workspace == images / ".manga-thai-translator"
+    assert [Path(page.source_path).name for page in project.pages] == [
+        "หน้า1.JPG",
+        "หน้า2.jpeg",
+        "หน้า10.webp",
+    ]
+    assert all(Path(page.source_path).is_absolute() for page in project.pages)
+    assert list((workspace / "source").iterdir()) == []
+
+    preserved_page = project.pages[1]
+    preserved_block = TextBlock(
+        page_id=preserved_page.id,
+        bbox=BoundingBox(x=1, y=2, width=3, height=4),
+        reading_order=1,
+        translated_text="เก็บการแก้ไข",
+    )
+    preserved_page.blocks = [preserved_block]
+    ProjectRepository.save(project, workspace)
+
+    reopened, reopened_workspace = ProjectService.open_image_files([unselected, selected[1]])
+
+    assert reopened_workspace == workspace
+    assert [Path(page.source_path).name for page in reopened.pages] == [
+        "หน้า1.JPG",
+        "หน้า2.jpeg",
+        "หน้า3.png",
+        "หน้า10.webp",
+    ]
+    restored = next(page for page in reopened.pages if page.id == preserved_page.id)
+    assert restored.blocks[0].id == preserved_block.id
+    assert restored.blocks[0].translated_text == "เก็บการแก้ไข"
+    saved = (workspace / "project.json").read_bytes()
+
+    unchanged, unchanged_workspace = ProjectService.open_image_files([selected[1], unselected])
+
+    assert unchanged_workspace == workspace
+    assert unchanged == reopened
+    assert (workspace / "project.json").read_bytes() == saved
+    assert all(path.read_bytes() == content for path, content in original_bytes.items())
+
+
+def test_open_image_files_rejects_mixed_parents_before_creating_workspace(
+    tmp_path: Path,
+) -> None:
+    first = make_image(tmp_path / "one" / "page1.png")
+    second = make_image(tmp_path / "two" / "page2.png")
+
+    with pytest.raises(ValueError, match="same parent directory"):
+        ProjectService.open_image_files([first, second])
+
+    assert not (first.parent / ".manga-thai-translator").exists()
+    assert not (second.parent / ".manga-thai-translator").exists()

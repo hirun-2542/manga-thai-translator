@@ -4,6 +4,7 @@ from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -25,7 +26,7 @@ OLLAMA_BASE_URL = "http://localhost:11434"
 
 
 class TranslationProviderDialog(QDialog):
-    """Edit text-only translation provider settings."""
+    """Edit runtime-only translation provider settings."""
 
     def __init__(
         self,
@@ -33,13 +34,14 @@ class TranslationProviderDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Translation provider")
+        self.setWindowTitle("Translation Provider Settings")
         self._configuration: ProviderConfiguration | None = None
 
         self.provider_combo = QComboBox()
         self.provider_combo.addItem("OpenAI-compatible", "openai-compatible")
         self.provider_combo.addItem("Ollama (local)", "ollama")
-        self.provider_combo.setToolTip("Choose a cloud-compatible API or local Ollama.")
+        self.provider_combo.addItem("Codex CLI (logged in)", "codex-cli")
+        self.provider_combo.setToolTip("Choose OpenAI-compatible, Ollama, or Codex CLI.")
 
         self.base_url_edit = QLineEdit()
         self.base_url_edit.setToolTip("Provider server URL.")
@@ -51,7 +53,7 @@ class TranslationProviderDialog(QDialog):
         self.api_key_env_edit = QLineEdit()
         self.api_key_env_edit.setPlaceholderText("Example: MANGA_TRANSLATION_API_KEY")
         self.api_key_env_edit.setToolTip(
-            "Environment variable name containing the API key; never enter the key itself."
+            "Environment variable containing the API key; never enter the key itself."
         )
 
         self.temperature_spin = QDoubleSpinBox()
@@ -70,20 +72,28 @@ class TranslationProviderDialog(QDialog):
         self.retry_spin.setToolTip("Number of retries after a recoverable provider error.")
 
         self.instructions_edit = QPlainTextEdit()
+        self.instructions_edit.setTabChangesFocus(True)
         self.instructions_edit.setPlaceholderText("Optional translation instructions")
         self.instructions_edit.setToolTip(
             "Optional instructions included with translation requests."
         )
 
+        self.upload_images_checkbox = QCheckBox("Allow Codex to receive source page images")
+        self.upload_images_checkbox.setChecked(False)
+        self.upload_images_checkbox.setToolTip(
+            "Opt in to sending source page images through the logged-in Codex CLI."
+        )
+
         form = QFormLayout()
         form.addRow("Provider", self.provider_combo)
         form.addRow("Base URL", self.base_url_edit)
-        form.addRow("Model", self.model_edit)
+        form.addRow("Translation Model", self.model_edit)
         form.addRow("API key environment variable", self.api_key_env_edit)
         form.addRow("Temperature", self.temperature_spin)
         form.addRow("Timeout", self.timeout_spin)
         form.addRow("Retry count", self.retry_spin)
         form.addRow("Instructions", self.instructions_edit)
+        form.addRow("Image upload", self.upload_images_checkbox)
 
         self.privacy_label = QLabel(
             "Only OCR text, block IDs, project context, glossary, and instructions are sent. "
@@ -103,6 +113,8 @@ class TranslationProviderDialog(QDialog):
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        self.button_box.button(QDialogButtonBox.StandardButton.Ok).setText("OK")
+        self.button_box.button(QDialogButtonBox.StandardButton.Cancel).setText("Cancel")
         self.button_box.setToolTip("Save or discard the translation provider settings.")
 
         layout = QVBoxLayout(self)
@@ -112,6 +124,7 @@ class TranslationProviderDialog(QDialog):
         layout.addWidget(self.button_box)
 
         self.provider_combo.currentIndexChanged.connect(self._provider_changed)
+        self.upload_images_checkbox.toggled.connect(self._update_privacy_notice)
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
 
@@ -131,39 +144,42 @@ class TranslationProviderDialog(QDialog):
 
     def accept(self) -> None:
         """Validate the fields before closing the dialog."""
+        provider = self.provider_combo.currentData()
+        codex_cli = provider == "codex-cli"
         base_url = self.base_url_edit.text().strip()
-        try:
-            parsed_url = urlsplit(base_url)
-            if (
-                parsed_url.scheme not in {"http", "https"}
-                or not parsed_url.hostname
-                or any(character.isspace() for character in parsed_url.netloc)
-            ):
-                raise ValueError
-            parsed_url.port
-        except ValueError:
-            self._configuration = None
-            self.error_label.setText(
-                "Invalid configuration: Base URL must be an absolute HTTP or HTTPS URL with a host."
-            )
-            self.error_label.setVisible(True)
-            return
+        if not codex_cli:
+            try:
+                parsed_url = urlsplit(base_url)
+                if (
+                    parsed_url.scheme not in {"http", "https"}
+                    or not parsed_url.hostname
+                    or any(character.isspace() for character in parsed_url.netloc)
+                ):
+                    raise ValueError
+                parsed_url.port
+            except ValueError:
+                self._configuration = None
+                self.error_label.setText(
+                    "Invalid configuration: Base URL must be an absolute HTTP or HTTPS URL with a host."
+                )
+                self.error_label.setVisible(True)
+                return
 
         try:
             configuration = ProviderConfiguration(
-                provider=self.provider_combo.currentData(),
-                base_url=base_url,
+                provider=provider,
+                base_url=None if codex_cli else base_url,
                 model=self.model_edit.text().strip(),
                 api_key_env=(
                     None
-                    if self.provider_combo.currentData() == "ollama"
+                    if provider in {"ollama", "codex-cli"}
                     else self.api_key_env_edit.text().strip() or None
                 ),
                 temperature=self.temperature_spin.value(),
                 timeout_seconds=self.timeout_spin.value(),
                 retry_count=self.retry_spin.value(),
                 instructions=self.instructions_edit.toPlainText(),
-                uploads_images=False,
+                uploads_images=codex_cli and self.upload_images_checkbox.isChecked(),
             )
         except ValidationError as error:
             self._configuration = None
@@ -177,11 +193,43 @@ class TranslationProviderDialog(QDialog):
         super().accept()
 
     def _provider_changed(self, *_args: object) -> None:
-        ollama = self.provider_combo.currentData() == "ollama"
-        self.base_url_edit.setText(OLLAMA_BASE_URL if ollama else OPENAI_BASE_URL)
-        if ollama:
+        provider = self.provider_combo.currentData()
+        codex_cli = provider == "codex-cli"
+        ollama = provider == "ollama"
+        self.base_url_edit.setText(
+            "" if codex_cli else OLLAMA_BASE_URL if ollama else OPENAI_BASE_URL
+        )
+        self.base_url_edit.setEnabled(not codex_cli)
+        self.upload_images_checkbox.setVisible(codex_cli)
+        self.upload_images_checkbox.setEnabled(codex_cli)
+        if not codex_cli:
+            self.upload_images_checkbox.setChecked(False)
+        if codex_cli:
+            self.model_edit.setText("default")
+        else:
+            if self.model_edit.text() == "default":
+                self.model_edit.clear()
+        if ollama or codex_cli:
             self.api_key_env_edit.clear()
-        self.api_key_env_edit.setEnabled(not ollama)
+        self.api_key_env_edit.setEnabled(not (ollama or codex_cli))
+        self._update_privacy_notice()
+
+    def _update_privacy_notice(self, *_args: object) -> None:
+        if self.provider_combo.currentData() == "codex-cli":
+            image_notice = (
+                "Source images will be sent through Codex."
+                if self.upload_images_checkbox.isChecked()
+                else "Images will not be sent."
+            )
+            self.privacy_label.setText(
+                "OCR text, block IDs, project context, glossary, and instructions are sent "
+                f"through the logged-in Codex CLI. {image_notice}"
+            )
+            return
+        self.privacy_label.setText(
+            "Only OCR text, block IDs, project context, glossary, and instructions are sent. "
+            "Images are not sent by these providers."
+        )
 
     def _load(self, configuration: ProviderConfiguration) -> None:
         index = self.provider_combo.findData(configuration.provider)
@@ -195,6 +243,12 @@ class TranslationProviderDialog(QDialog):
         self.timeout_spin.setValue(configuration.timeout_seconds)
         self.retry_spin.setValue(configuration.retry_count)
         self.instructions_edit.setPlainText(configuration.instructions)
-        if self.provider_combo.currentData() == "ollama":
+        self.upload_images_checkbox.setChecked(
+            configuration.provider == "codex-cli" and configuration.uploads_images
+        )
+        if self.provider_combo.currentData() in {"ollama", "codex-cli"}:
             self.api_key_env_edit.clear()
             self.api_key_env_edit.setEnabled(False)
+        if self.provider_combo.currentData() == "codex-cli":
+            self.base_url_edit.clear()
+        self._update_privacy_notice()

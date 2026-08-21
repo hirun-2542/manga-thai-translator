@@ -1,14 +1,18 @@
 import asyncio
 import json
 from email.message import Message
+from pathlib import Path
 from urllib import error
 from uuid import UUID, uuid4
 
 import pytest
+from PIL import Image
 
 from app.core.models import (
+    BlockStatus,
     Character,
     GlossaryEntry,
+    Page,
     ProviderConfiguration,
     SourceLanguage,
     TranslationContext,
@@ -16,6 +20,7 @@ from app.core.models import (
 )
 from app.services.errors import ProviderError
 from app.services.translation import (
+    CodexCliTranslationProvider,
     OllamaTranslationProvider,
     OpenAICompatibleTranslationProvider,
 )
@@ -151,6 +156,470 @@ def test_ollama_request_and_response_use_native_envelope_without_key() -> None:
     assert seen["payload"]["format"] == "json"
     assert seen["payload"]["options"] == {"temperature": 0.4}
     assert "Authorization" not in seen["headers"]
+
+
+def test_codex_cli_is_text_only_ephemeral_read_only_and_uses_schema(monkeypatch) -> None:
+    seen = {}
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self, prompt):
+            seen["prompt"] = prompt
+            return _content().encode(), b"ignored stderr"
+
+    async def create_subprocess_exec(*command, **kwargs):
+        seen["command"] = command
+        seen["kwargs"] = kwargs
+        schema_path = command[command.index("--output-schema") + 1]
+        seen["schema_path"] = schema_path
+        seen["schema"] = json.loads(Path(schema_path).read_text(encoding="utf-8"))
+        return Process()
+
+    monkeypatch.setattr(
+        "app.services.translation.codex_cli.asyncio.create_subprocess_exec",
+        create_subprocess_exec,
+    )
+    configuration = _configuration("codex-cli")
+    configuration.model = "default"
+    provider = CodexCliTranslationProvider(configuration, retry_delay=0)
+
+    results = asyncio.run(provider.translate_blocks(_blocks(), _context()))
+
+    assert seen["command"][:2] == ("codex", "exec")
+    assert seen["command"][-1] == "-"
+    assert "--ephemeral" in seen["command"]
+    assert seen["command"][seen["command"].index("--sandbox") + 1] == "read-only"
+    assert "--skip-git-repo-check" in seen["command"]
+    assert "--ignore-user-config" in seen["command"]
+    assert "--ignore-rules" in seen["command"]
+    assert seen["command"][seen["command"].index("--color") + 1] == "never"
+    assert "--model" not in seen["command"]
+    assert "--image" not in seen["command"]
+    assert seen["kwargs"] == {
+        "stdin": asyncio.subprocess.PIPE,
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.PIPE,
+        "cwd": str(Path(seen["schema_path"]).parent),
+    }
+    messages = json.loads(seen["prompt"])
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert "do not inspect files or run tools" in messages[0]["content"].lower()
+    assert "images" not in seen["prompt"].decode().lower()
+    assert seen["schema"]["additionalProperties"] is False
+    assert not Path(seen["schema_path"]).exists()
+    assert not Path(seen["kwargs"]["cwd"]).exists()
+    assert [result.id for result in results] == [FIRST_ID, SECOND_ID]
+
+
+def test_codex_cli_image_translates_clamps_and_normalizes_locally(monkeypatch, tmp_path) -> None:
+    image_path = tmp_path / "หน้า.png"
+    image_path.write_bytes(b"not opened by test")
+    original_bytes = image_path.read_bytes()
+    page = Page(source_path=str(image_path), width=100, height=100)
+    seen = {}
+    response = json.dumps(
+        {
+            "blocks": [
+                {
+                    "bbox": {"x": -5, "y": 10, "width": 30, "height": 25},
+                    "reading_order": 8,
+                    "source_language": "ja",
+                    "source_text": "ただいま",
+                    "translated_text": "กลับมาแล้ว",
+                    "note": "",
+                },
+                {
+                    "bbox": {"x": 90, "y": 90, "width": 30, "height": 30},
+                    "reading_order": 2,
+                    "source_language": "en",
+                    "source_text": "Welcome home",
+                    "translated_text": "ยินดีต้อนรับกลับบ้าน",
+                    "note": "",
+                },
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self, prompt):
+            seen["prompt"] = prompt.decode()
+            return response.encode(), b"ignored secret stderr"
+
+    async def create_subprocess_exec(*command, **kwargs):
+        seen["command"] = command
+        seen["cwd"] = kwargs["cwd"]
+        schema_path = Path(command[command.index("--output-schema") + 1])
+        seen["schema_path"] = schema_path
+        seen["schema"] = json.loads(schema_path.read_text(encoding="utf-8"))
+        return Process()
+
+    monkeypatch.setattr(
+        "app.services.translation.codex_cli.asyncio.create_subprocess_exec",
+        create_subprocess_exec,
+    )
+    configuration = _configuration("codex-cli").model_copy(update={"uploads_images": True})
+    provider = CodexCliTranslationProvider(configuration, retry_delay=0)
+
+    blocks = asyncio.run(provider.translate_page_image(page, image_path, _context()))
+
+    image_index = seen["command"].index("--image")
+    assert seen["command"][image_index + 1] == str(image_path.resolve())
+    assert seen["command"].count("--image") == 1
+    assert seen["command"][-1] == "-"
+    assert seen["schema"]["properties"]["blocks"]["items"]["properties"]["source_language"][
+        "enum"
+    ] == ["ja", "en", "ko", "zh-Hans", "zh-Hant"]
+    assert "Read every dialogue and narration block" in seen["prompt"]
+    assert "exactly one block per distinct speech-bubble or narration container" in seen["prompt"]
+    assert "Do not omit, invent,\nsplit, or merge blocks" in seen["prompt"]
+    assert "preserving every character and exact\npunctuation" in seen["prompt"]
+    assert "tightly\nenclose all original source-text glyphs" in seen["prompt"]
+    assert "with 4 pixels of padding on every side" in seen["prompt"]
+    assert "excluding the bubble border, tail, character art, and adjacent panels" in seen["prompt"]
+    assert "largest safe rectangular interior" not in seen["prompt"]
+    assert "crop-local pixel coordinates with crop origin (0, 0)" in seen["prompt"]
+    assert "natural Thai" in seen["prompt"]
+    assert "Do not inspect the filesystem or run tools" in seen["prompt"]
+    assert "half-open local core y range [0,100)" in seen["prompt"]
+    assert "global y" not in seen["prompt"]
+    assert not seen["schema_path"].exists()
+    assert not Path(seen["cwd"]).exists()
+    assert [block.reading_order for block in blocks] == [1, 2]
+    assert [block.source_text for block in blocks] == ["Welcome home", "ただいま"]
+    assert blocks[0].bbox.model_dump() == {"x": 90.0, "y": 90.0, "width": 10.0, "height": 10.0}
+    assert blocks[1].bbox.model_dump() == {"x": 0.0, "y": 10.0, "width": 25.0, "height": 25.0}
+    assert len({block.id for block in blocks}) == 2
+    assert all(block.page_id == page.id for block in blocks)
+    assert all(block.ocr_provider == "codex-image" for block in blocks)
+    assert all(block.status is BlockStatus.TRANSLATED for block in blocks)
+    assert [block.source_language for block in blocks] == [SourceLanguage.EN, SourceLanguage.JA]
+    assert image_path.read_bytes() == original_bytes
+
+
+def test_codex_cli_tall_image_processes_lossless_overlapping_tiles_sequentially(
+    monkeypatch, tmp_path
+) -> None:
+    image_path = tmp_path / "tall.png"
+    Image.new("RGB", (80, 5000), "white").save(image_path, format="PNG")
+    original_bytes = image_path.read_bytes()
+    page = Page(source_path=str(image_path), width=80, height=5000)
+    seen = {"commands": [], "prompts": [], "tile_paths": []}
+    responses = [
+        {
+            "blocks": [
+                {
+                    "bbox": {"x": -5, "y": 10, "width": 30, "height": 20},
+                    "reading_order": 9,
+                    "source_language": "ja",
+                    "source_text": "first",
+                    "translated_text": "หนึ่ง",
+                    "note": "",
+                },
+                {
+                    "bbox": {"x": 5, "y": 1655, "width": 20, "height": 30},
+                    "reading_order": 1,
+                    "source_language": "en",
+                    "source_text": "boundary duplicate",
+                    "translated_text": "รอยต่อ",
+                    "note": "",
+                },
+            ]
+        },
+        {
+            "blocks": [
+                {
+                    "bbox": {"x": 5, "y": 200, "width": 20, "height": 30},
+                    "reading_order": 9,
+                    "source_language": "ko",
+                    "source_text": "second",
+                    "translated_text": "สอง",
+                    "note": "",
+                },
+                {
+                    "bbox": {"x": 5, "y": 89, "width": 20, "height": 30},
+                    "reading_order": 1,
+                    "source_language": "en",
+                    "source_text": "boundary duplicate",
+                    "translated_text": "รอยต่อ",
+                    "note": "",
+                },
+            ]
+        },
+        {
+            "blocks": [
+                {
+                    "bbox": {"x": 10, "y": 1750, "width": 30, "height": 100},
+                    "reading_order": 0,
+                    "source_language": "zh-Hans",
+                    "source_text": "third",
+                    "translated_text": "สาม",
+                    "note": "",
+                }
+            ]
+        },
+    ]
+
+    class Process:
+        def __init__(self, response):
+            self.response = response
+
+        returncode = 0
+
+        async def communicate(self, prompt):
+            seen["prompts"].append(prompt.decode())
+            return json.dumps(self.response, ensure_ascii=False).encode(), b""
+
+    async def create_subprocess_exec(*command, **kwargs):
+        tile_paths = [
+            Path(command[index + 1])
+            for index, argument in enumerate(command)
+            if argument == "--image"
+        ]
+        assert len(tile_paths) == 1
+        assert tile_paths[0].exists()
+        assert tile_paths[0].suffix == ".png"
+        assert tile_paths[0].read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+        assert [path.name for path in Path(kwargs["cwd"]).iterdir()] == [
+            "translation-response.schema.json"
+        ]
+        seen["commands"].append(command)
+        seen["tile_paths"].extend(tile_paths)
+        return Process(responses[len(seen["commands"]) - 1])
+
+    monkeypatch.setattr(
+        "app.services.translation.codex_cli.asyncio.create_subprocess_exec",
+        create_subprocess_exec,
+    )
+    configuration = _configuration("codex-cli").model_copy(update={"uploads_images": True})
+    provider = CodexCliTranslationProvider(configuration, retry_delay=0)
+
+    blocks = asyncio.run(provider.translate_page_image(page, image_path, _context()))
+
+    assert len(seen["commands"]) == 3
+    assert all(command.count("--image") == 1 for command in seen["commands"])
+    assert len(seen["tile_paths"]) == 3
+    assert image_path.resolve() not in seen["tile_paths"]
+    assert all(not path.exists() for path in seen["tile_paths"])
+    assert "half-open local core y range [0,1666)" in seen["prompts"][0]
+    assert "half-open local core y range [100,1767)" in seen["prompts"][1]
+    assert "half-open local core y range [100,1767)" in seen["prompts"][2]
+    assert all("global y" not in prompt for prompt in seen["prompts"])
+    assert all("single attached crop" in prompt for prompt in seen["prompts"])
+    assert [block.reading_order for block in blocks] == [1, 2, 3, 4]
+    assert [block.source_text for block in blocks] == [
+        "first",
+        "boundary duplicate",
+        "second",
+        "third",
+    ]
+    assert blocks[0].bbox.model_dump() == {"x": 0.0, "y": 10.0, "width": 25.0, "height": 20.0}
+    assert blocks[1].bbox.y == 1655
+    assert blocks[2].bbox.y == 1766
+    assert blocks[3].bbox.model_dump() == {
+        "x": 10.0,
+        "y": 4983.0,
+        "width": 30.0,
+        "height": 17.0,
+    }
+    assert image_path.read_bytes() == original_bytes
+
+
+@pytest.mark.parametrize(("uploads_images", "create_image"), [(False, True), (True, False)])
+def test_codex_cli_image_requires_opt_in_and_existing_file(
+    monkeypatch, tmp_path, uploads_images: bool, create_image: bool
+) -> None:
+    image_path = tmp_path / "page.png"
+    if create_image:
+        image_path.write_bytes(b"image")
+    page = Page(source_path=str(image_path), width=100, height=100)
+
+    async def unexpected_subprocess(*command, **kwargs):
+        pytest.fail("Codex CLI must not run before image input validation")
+
+    monkeypatch.setattr(
+        "app.services.translation.codex_cli.asyncio.create_subprocess_exec",
+        unexpected_subprocess,
+    )
+    configuration = _configuration("codex-cli").model_copy(
+        update={"uploads_images": uploads_images}
+    )
+    provider = CodexCliTranslationProvider(configuration, retry_delay=0)
+
+    with pytest.raises(ProviderError) as raised:
+        asyncio.run(provider.translate_page_image(page, image_path, _context()))
+
+    assert raised.value.recoverable is False
+
+
+def test_codex_cli_image_invalid_response_retries(monkeypatch, tmp_path) -> None:
+    image_path = tmp_path / "page.png"
+    image_path.write_bytes(b"image")
+    page = Page(source_path=str(image_path), width=100, height=100)
+    calls = 0
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self, prompt):
+            nonlocal calls
+            calls += 1
+            source_language = "auto" if calls == 1 else "ko"
+            return json.dumps(
+                {
+                    "blocks": [
+                        {
+                            "bbox": {"x": 1, "y": 2, "width": 3, "height": 4},
+                            "reading_order": 0,
+                            "source_language": source_language,
+                            "source_text": "안녕",
+                            "translated_text": "สวัสดี",
+                            "note": "",
+                        }
+                    ]
+                }
+            ).encode(), b""
+
+    async def create_subprocess_exec(*command, **kwargs):
+        return Process()
+
+    monkeypatch.setattr(
+        "app.services.translation.codex_cli.asyncio.create_subprocess_exec",
+        create_subprocess_exec,
+    )
+    configuration = _configuration("codex-cli", retry_count=1).model_copy(
+        update={"uploads_images": True}
+    )
+    provider = CodexCliTranslationProvider(configuration, retry_delay=0)
+
+    blocks = asyncio.run(provider.translate_page_image(page, image_path, _context()))
+
+    assert calls == 2
+    assert blocks[0].source_language is SourceLanguage.KO
+
+
+def test_codex_cli_passes_non_default_model(monkeypatch) -> None:
+    seen = {}
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self, prompt):
+            return _content().encode(), b""
+
+    async def create_subprocess_exec(*command, **kwargs):
+        seen["command"] = command
+        return Process()
+
+    monkeypatch.setattr(
+        "app.services.translation.codex_cli.asyncio.create_subprocess_exec",
+        create_subprocess_exec,
+    )
+    provider = CodexCliTranslationProvider(
+        _configuration("codex-cli"),
+        retry_delay=0,
+    )
+
+    asyncio.run(provider.translate_blocks(_blocks(), _context()))
+
+    model_index = seen["command"].index("--model")
+    assert seen["command"][model_index + 1] == "configured-model"
+
+
+def test_codex_cli_missing_executable_is_clear_and_not_retried(monkeypatch) -> None:
+    calls = 0
+
+    async def create_subprocess_exec(*command, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise FileNotFoundError
+
+    monkeypatch.setattr(
+        "app.services.translation.codex_cli.asyncio.create_subprocess_exec",
+        create_subprocess_exec,
+    )
+    provider = CodexCliTranslationProvider(
+        _configuration("codex-cli", retry_count=2),
+        retry_delay=0,
+    )
+
+    with pytest.raises(ProviderError, match="executable was not found") as raised:
+        asyncio.run(provider.translate_blocks(_blocks(), _context()))
+
+    assert calls == 1
+    assert raised.value.recoverable is False
+
+
+def test_codex_cli_nonzero_exit_retries_without_stderr_leak(monkeypatch) -> None:
+    calls = 0
+
+    class Process:
+        returncode = 7
+
+        async def communicate(self, prompt):
+            return b"", b"top-secret"
+
+    async def create_subprocess_exec(*command, **kwargs):
+        nonlocal calls
+        calls += 1
+        return Process()
+
+    monkeypatch.setattr(
+        "app.services.translation.codex_cli.asyncio.create_subprocess_exec",
+        create_subprocess_exec,
+    )
+    provider = CodexCliTranslationProvider(
+        _configuration("codex-cli", retry_count=1),
+        retry_delay=0,
+    )
+
+    with pytest.raises(ProviderError, match="status 7") as raised:
+        asyncio.run(provider.translate_blocks(_blocks(), _context()))
+
+    assert calls == 2
+    assert "top-secret" not in str(raised.value)
+
+
+def test_codex_cli_timeout_terminates_process_and_retries(monkeypatch) -> None:
+    processes = []
+
+    class Process:
+        returncode = None
+        terminated = False
+
+        async def communicate(self, prompt):
+            await asyncio.Event().wait()
+
+        def terminate(self):
+            self.terminated = True
+            self.returncode = -15
+
+        async def wait(self):
+            return self.returncode
+
+    async def create_subprocess_exec(*command, **kwargs):
+        process = Process()
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(
+        "app.services.translation.codex_cli.asyncio.create_subprocess_exec",
+        create_subprocess_exec,
+    )
+    configuration = _configuration("codex-cli", retry_count=1).model_copy(
+        update={"timeout_seconds": 0.01}
+    )
+    provider = CodexCliTranslationProvider(configuration, retry_delay=0)
+
+    with pytest.raises(ProviderError, match="timed out") as raised:
+        asyncio.run(provider.translate_blocks(_blocks(), _context()))
+
+    assert len(processes) == 2
+    assert all(process.terminated for process in processes)
+    assert raised.value.recoverable is True
 
 
 @pytest.mark.parametrize(

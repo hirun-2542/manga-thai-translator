@@ -35,6 +35,101 @@ class _ImageInfo:
 
 class ProjectService:
     @classmethod
+    def open_image_files(
+        cls,
+        image_paths: PathInput | Iterable[PathInput],
+        default_source_language: SourceLanguage = SourceLanguage.AUTO,
+        default_reading_order: ReadingOrderPreset = ReadingOrderPreset.WEBTOON_VERTICAL,
+    ) -> tuple[Project, Path]:
+        images = cls._inspect_images(image_paths)
+        parents = {image.source.parent for image in images}
+        if len(parents) != 1:
+            raise ValueError("selected images must share the same parent directory")
+        return cls._open_images(
+            parents.pop(),
+            images,
+            default_source_language,
+            default_reading_order,
+        )
+
+    @classmethod
+    def open_image_folder(
+        cls,
+        image_dir: PathInput,
+        default_source_language: SourceLanguage = SourceLanguage.AUTO,
+        default_reading_order: ReadingOrderPreset = ReadingOrderPreset.WEBTOON_VERTICAL,
+    ) -> tuple[Project, Path]:
+        image_directory = Path(image_dir).resolve()
+        if not image_directory.is_dir():
+            raise NotADirectoryError(f"image folder not found: {image_directory}")
+
+        workspace = image_directory / ".manga-thai-translator"
+        root_images = [
+            path
+            for path in image_directory.iterdir()
+            if path.is_file() and path.suffix.lower() in _SUPPORTED_EXTENSIONS
+        ]
+        if not root_images:
+            project_file = workspace / "project.json"
+            if project_file.exists() or project_file.is_symlink():
+                return ProjectRepository.load(workspace), workspace
+        images = cls._inspect_images(root_images or image_directory)
+        return cls._open_images(
+            image_directory,
+            images,
+            default_source_language,
+            default_reading_order,
+        )
+
+    @classmethod
+    def _open_images(
+        cls,
+        image_directory: Path,
+        images: list[_ImageInfo],
+        default_source_language: SourceLanguage,
+        default_reading_order: ReadingOrderPreset,
+    ) -> tuple[Project, Path]:
+        workspace = image_directory / ".manga-thai-translator"
+        project_file = workspace / "project.json"
+        if not project_file.exists() and not project_file.is_symlink():
+            project = cls.create_project(
+                workspace,
+                image_directory.name or "Manga",
+                [image.source for image in images],
+                default_source_language,
+                default_reading_order,
+                copy_sources=False,
+            )
+            return project, workspace
+
+        project = ProjectRepository.load(workspace)
+        existing_sources = {
+            (
+                Path(page.source_path)
+                if Path(page.source_path).is_absolute()
+                else workspace / page.source_path
+            ).resolve()
+            for page in project.pages
+        }
+        new_images = [image for image in images if image.source not in existing_sources]
+        if new_images:
+            copied = project.model_copy(deep=True)
+            copied.pages.extend(
+                Page(source_path=str(image.source), width=image.width, height=image.height)
+                for image in new_images
+            )
+            copied.pages.sort(
+                key=lambda page: (
+                    natural_sort_key(Path(page.source_path).name),
+                    natural_sort_key(page.source_path),
+                )
+            )
+            copied.updated_at = utc_now()
+            ProjectRepository.save(copied, workspace)
+            project = copied
+        return project, workspace
+
+    @classmethod
     def create_project(
         cls,
         project_dir: PathInput,

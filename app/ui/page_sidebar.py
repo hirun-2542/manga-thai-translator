@@ -16,6 +16,7 @@ class PageSidebar(QListWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self.setAccessibleName("Page list")
         self.setToolTip("Select a page to view and edit its text blocks.")
         self.currentItemChanged.connect(self._emit_page_selected)
 
@@ -24,7 +25,9 @@ class PageSidebar(QListWidget):
         self.clear()
         for number, page in enumerate(pages, start=1):
             filename = Path(page.source_path).name
-            item = QListWidgetItem(f"{number}. {filename} — {len(page.blocks)} blocks")
+            count = len(page.blocks)
+            label = "block" if count == 1 else "blocks"
+            item = QListWidgetItem(f"{number}. {filename} — {count} {label}")
             item.setData(Qt.ItemDataRole.UserRole, page.id)
             self.addItem(item)
         del blocker

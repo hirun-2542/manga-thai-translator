@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from math import isfinite
+from math import cos, isfinite, radians, sin
 
 from app.core.models import BoundingBox
 
@@ -43,6 +43,14 @@ def clamp_bbox(
     ):
         raise ValueError("image dimensions must be positive")
 
+    if (
+        bbox.x >= 0.0
+        and bbox.y >= 0.0
+        and bbox.x + bbox.width <= image_width
+        and bbox.y + bbox.height <= image_height
+    ):
+        return bbox
+
     left = max(0.0, bbox.x)
     top = max(0.0, bbox.y)
     right = min(image_width, bbox.x + bbox.width)
@@ -51,3 +59,41 @@ def clamp_bbox(
         raise ValueError("bounding box has no area inside the image")
 
     return BoundingBox(x=left, y=top, width=right - left, height=bottom - top)
+
+
+def rotated_bbox_corners(
+    bbox: BoundingBox,
+    rotation_degrees: float,
+) -> tuple[tuple[float, float], ...]:
+    """Return region corners after clockwise image-space rotation around its center."""
+    center_x = bbox.x + bbox.width / 2
+    center_y = bbox.y + bbox.height / 2
+    angle = radians(rotation_degrees)
+    cosine = cos(angle)
+    sine = sin(angle)
+    corners = (
+        (bbox.x, bbox.y),
+        (bbox.x + bbox.width, bbox.y),
+        (bbox.x + bbox.width, bbox.y + bbox.height),
+        (bbox.x, bbox.y + bbox.height),
+    )
+    return tuple(
+        (
+            center_x + (x - center_x) * cosine - (y - center_y) * sine,
+            center_y + (x - center_x) * sine + (y - center_y) * cosine,
+        )
+        for x, y in corners
+    )
+
+
+def rotated_bbox_bounds(bbox: BoundingBox, rotation_degrees: float) -> BoundingBox:
+    """Return the axis-aligned bounds enclosing a rotated region."""
+    corners = rotated_bbox_corners(bbox, rotation_degrees)
+    xs = [point[0] for point in corners]
+    ys = [point[1] for point in corners]
+    return BoundingBox(
+        x=min(xs),
+        y=min(ys),
+        width=max(xs) - min(xs),
+        height=max(ys) - min(ys),
+    )
